@@ -10,7 +10,10 @@ The server provides:
 from __future__ import annotations
 
 import argparse
+import asyncio
+import json
 import math
+import os
 import struct
 import socket
 import threading
@@ -22,6 +25,15 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional until dependencies are installed
+    load_dotenv = None
+
+from services.dify_service import DifyService
+from services.tour_orchestrator import TourOrchestrator
+from services.tts_service import ERROR_TEXT, synthesize_wav_16k
 
 
 MAGIC = b"WTK1"
@@ -90,6 +102,12 @@ class AiSession:
     received: int = 0
     reply: bytes | None = None
     save_path: Path | None = None
+    device: str = "walkie-01"
+    language: str = "zh"
+    question_text: str = ""
+    answer_text: str = ""
+    image_context: str = ""
+    upload_wav_path: Path | None = None
 
 
 def log(message: str) -> None:
@@ -420,12 +438,22 @@ def create_http_app(
     ai_reply_repeat: int,
     ai_reply_extra_chunk: bool,
 ) -> FastAPI:
+    if load_dotenv is not None:
+        load_dotenv()
+
     app = FastAPI(title="Walkie Talkie Test Server")
     app.state.save_dir = wav_save_dir
     app.state.jpg_save_dir = jpg_save_dir
     app.state.ai_sessions = {}
+    app.state.latest_images = {}
     app.state.ai_reply_repeat = max(ai_reply_repeat, 1)
     app.state.ai_reply_extra_chunk = ai_reply_extra_chunk
+    app.state.tour_orchestrator = TourOrchestrator(
+        DifyService(
+            os.getenv("DIFY_BASE_URL", ""),
+            os.getenv("DIFY_API_KEY", ""),
+        )
+    )
 
     def get_session(session_id: str) -> AiSession:
         session = app.state.ai_sessions.get(session_id)
@@ -441,9 +469,25 @@ def create_http_app(
     async def ai_start(request: Request) -> dict[str, object]:
         body = await request.body()
         await log_request(request, body, "start")
+        body_json: dict[str, object] = {}
+        if body:
+            try:
+                parsed = json.loads(body.decode("utf-8"))
+                if isinstance(parsed, dict):
+                    body_json = parsed
+                else:
+                    log("AI start JSON body is not an object; using defaults")
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                log(f"AI start JSON parse failed: {exc}; using defaults")
+        device = str(body_json.get("device") or "walkie-01")
+        language = str(body_json.get("language") or "zh")
         session_id = uuid.uuid4().hex[:12]
-        app.state.ai_sessions[session_id] = AiSession(session_id=session_id)
-        log(f"AI start session={session_id}")
+        app.state.ai_sessions[session_id] = AiSession(
+            session_id=session_id,
+            device=device,
+            language=language,
+        )
+        log(f"AI start session={session_id} device={device} language={language}")
         return {"session": session_id, "chunk_size": DEFAULT_CHUNK_SIZE}
 
     @app.post("/ai/upload")
@@ -485,15 +529,31 @@ def create_http_app(
         ok, save_path = validate_and_log_wav(full_wav, app.state.save_dir, f"AI finish session={session}")
         if not ok:
             raise HTTPException(status_code=400, detail={"ok": False, "error": "invalid wav"})
-        # Link test: echo uploaded PCM as a generated WAV reply. The repeat and
-        # extra-chunk knobs validate chunked playback without a real AI backend.
-        reply = make_ai_reply_wav(
-            full_wav,
-            app.state.ai_reply_repeat,
-            app.state.ai_reply_extra_chunk,
-        )
-        if reply is None:
-            raise HTTPException(status_code=400, detail={"ok": False, "error": "invalid reply wav"})
+        ai_session.upload_wav_path = save_path
+        spot_id = os.getenv("TOUR_DEFAULT_SPOT_ID", "dayanta")
+        mode = os.getenv("TOUR_MODE", "fixed")
+        image_context = ai_session.image_context
+        try:
+            answer_text, reply = await asyncio.to_thread(
+                app.state.tour_orchestrator.process_session,
+                save_path,
+                ai_session.device,
+                spot_id,
+                image_context,
+                mode,
+            )
+        except Exception as exc:
+            log(f"AI orchestration failed session={session}: {exc}")
+            answer_text = ERROR_TEXT
+            reply = synthesize_wav_16k(answer_text)
+
+        if parse_wav(reply) is None:
+            log(f"AI orchestration produced invalid WAV session={session}; using fallback")
+            answer_text = ERROR_TEXT
+            reply = synthesize_wav_16k(answer_text)
+        if parse_wav(reply) is None:
+            raise HTTPException(status_code=500, detail={"ok": False, "error": "invalid reply wav"})
+
         reply_wav = parse_wav(reply)
         reply_data = reply_wav.data_size if reply_wav is not None else 0
         reply_duration = 0.0
@@ -503,11 +563,11 @@ def create_http_app(
                 reply_duration = reply_data / bytes_per_sample / reply_wav.sample_rate
         log(
             f"AI reply session={session} len={len(reply)} data={reply_data} "
-            f"duration={reply_duration:.2f}s repeat={app.state.ai_reply_repeat} "
-            f"extra_chunk={int(app.state.ai_reply_extra_chunk)}"
+            f"duration={reply_duration:.2f}s mode={mode} text_chars={len(answer_text)}"
         )
         ai_session.reply = reply
         ai_session.save_path = save_path
+        ai_session.answer_text = answer_text
         return {"ok": True, "status": "processing"}
 
     @app.post("/ai/result_info")
@@ -517,7 +577,7 @@ def create_http_app(
         ai_session = get_session(session)
         if ai_session.reply is None:
             return {"ready": False}
-        return {"ready": True, "total": len(ai_session.reply), "format": "wav"}
+        return {"ready": True, "total": len(ai_session.reply), "format": "wav", "text": ai_session.answer_text}
 
     @app.post("/ai/result_chunk")
     async def ai_result_chunk(
@@ -538,7 +598,11 @@ def create_http_app(
         return Response(chunk, media_type="application/octet-stream")
 
     @app.post("/camera/upload")
-    async def camera_upload(request: Request, content_type: str = Header("", alias="content-type")) -> JSONResponse:
+    async def camera_upload(
+        request: Request,
+        content_type: str = Header("", alias="content-type"),
+        device: str = Query("walkie-01"),
+    ) -> JSONResponse:
         body = await request.body()
         await log_request(request, body, "camera_upload")
         if "image/jpeg" not in content_type.lower() and "image/jpg" not in content_type.lower():
@@ -558,6 +622,13 @@ def create_http_app(
 
         width = jpeg.width if jpeg and jpeg.width is not None else 0
         height = jpeg.height if jpeg and jpeg.height is not None else 0
+        app.state.latest_images[device or "walkie-01"] = {
+            "path": save_path,
+            "time": datetime.now(),
+            "width": width,
+            "height": height,
+        }
+        log(f"Camera latest image updated device={device or 'walkie-01'} file={save_path}")
         return JSONResponse(
             {
                 "ok": True,
