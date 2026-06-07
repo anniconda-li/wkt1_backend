@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
-import os
 import shutil
 import sys
 import wave
@@ -14,12 +12,12 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import core.config  # noqa: F401 - loads project .env
 from services.asr_service import transcribe_wav
-from services.dify_service import DifyService
+from services.bailian_app_service import BailianAppService
 from services.tts_service import synthesize_wav_16k
 
 
 DEFAULT_QUESTION = "大雁塔有什么故事？"
-MOCK_DIFY_ANSWER = "大雁塔是西安著名古迹，始建于唐代，最初用于保存玄奘从印度带回的佛经和佛像。"
+MOCK_BAILIAN_ANSWER = "大雁塔是西安著名古迹，始建于唐代，最初用于保存玄奘从印度带回的佛经和佛像。"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "tmp" / "latest"
 
 
@@ -59,15 +57,8 @@ def print_wav_info(label: str, path: Path) -> None:
     )
 
 
-def get_dify_answer(asr_text: str) -> str:
-    base_url = os.getenv("DIFY_BASE_URL", "https://api.dify.ai/v1")
-    api_key = os.getenv("DIFY_API_KEY", "")
-    user = os.getenv("DIFY_USER", "esp32s3-local-test")
-    if not api_key.strip():
-        raise RuntimeError("DIFY_API_KEY is not configured; use --mock-dify or --answer to skip real Dify")
-
-    service = DifyService(base_url=base_url, api_key=api_key)
-    return service.run_workflow(asr_text, device=user, user=user)
+def get_bailian_answer(asr_text: str) -> str:
+    return BailianAppService().ask(asr_text)
 
 
 def prepare_output_dir(path_text: str) -> Path:
@@ -84,11 +75,11 @@ def prepare_output_dir(path_text: str) -> Path:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run local question TTS -> ASR -> Dify -> reply TTS loop")
+    parser = argparse.ArgumentParser(description="Run local question TTS -> ASR -> Bailian app -> reply TTS loop")
     parser.add_argument("--text", default=DEFAULT_QUESTION, help="input question text")
     parser.add_argument("--wav", default="", help="existing question WAV path; skips question TTS when provided")
-    parser.add_argument("--answer", default="", help="manual answer text; skips Dify when provided")
-    parser.add_argument("--mock-dify", action="store_true", help="use a local mock Dify answer")
+    parser.add_argument("--answer", default="", help="manual answer text; skips Bailian when provided")
+    parser.add_argument("--mock-bailian", action="store_true", help="use a local mock Bailian answer")
     parser.add_argument("--out-dir", default=str(DEFAULT_OUTPUT_DIR.relative_to(PROJECT_ROOT)), help="output directory")
     args = parser.parse_args()
 
@@ -122,13 +113,13 @@ def main() -> None:
 
     if args.answer.strip():
         answer_text = args.answer.strip()
-    elif args.mock_dify:
-        answer_text = MOCK_DIFY_ANSWER
+    elif args.mock_bailian:
+        answer_text = MOCK_BAILIAN_ANSWER
     else:
-        answer_text = get_dify_answer(asr_text)
+        answer_text = get_bailian_answer(asr_text)
 
     answer_text_path.write_text(answer_text, encoding="utf-8")
-    print(f"[DIFY] answer: {answer_text}")
+    print(f"[BAILIAN] answer: {answer_text}")
 
     reply_wav_bytes = synthesize_wav_16k(answer_text)
     reply_wav_path.write_bytes(reply_wav_bytes)
@@ -137,25 +128,5 @@ def main() -> None:
     print_wav_info("TTS", reply_wav_path)
     print("[OK] ai audio loop passed")
 
-
-def cleanup_asyncio_tasks() -> None:
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        return
-    if loop.is_closed():
-        return
-
-    pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
-    if not pending:
-        return
-    for task in pending:
-        task.cancel()
-    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-
-
 if __name__ == "__main__":
-    try:
-        main()
-    finally:
-        cleanup_asyncio_tasks()
+    main()

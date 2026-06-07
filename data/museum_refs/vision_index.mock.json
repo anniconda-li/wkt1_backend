@@ -1,0 +1,185 @@
+{
+  "generated_at_unix": 1780803998,
+  "candidates_path": "config/museum_vision_candidates.json",
+  "total_candidates": 5,
+  "total_reference_images": 5,
+  "missing_images": 0,
+  "error_images": 0,
+  "entries": [
+    {
+      "candidate_id": "yingguo_yuying",
+      "standard_name": "应国玉鹰",
+      "category": "玉器",
+      "image_path": "data/museum_refs/yingguo_yuying/ref_1.jpg",
+      "exists": true,
+      "status": "ok",
+      "vision_result": {
+        "category": "陶瓷",
+        "object_type_guess": [
+          "器物"
+        ],
+        "visual_summary": "展柜中可见一件器物，轮廓较圆润，表面有浅色反光。",
+        "shape_features": [
+          "圆润轮廓",
+          "器物主体"
+        ],
+        "decoration_features": [
+          "表面反光",
+          "纹饰细节不清"
+        ],
+        "search_keywords": [
+          "陶瓷",
+          "器物",
+          "展柜",
+          "平顶山市博物馆"
+        ],
+        "is_clear": true,
+        "confidence": 0.65,
+        "risk": "mock 默认视觉描述，未判断具体展品名称"
+      },
+      "error_type": "",
+      "error": "",
+      "elapsed_ms": 0
+    },
+    {
+      "candidate_id": "panlongniu_daigai_tonghe",
+      "standard_name": "盘龙钮带盖铜盉",
+      "category": "青铜器",
+      "image_path": "data/museum_refs/panlongniu_daigai_tonghe/ref_1.jpg",
+      "exists": true,
+      "status": "ok",
+      "vision_result": {
+        "category": "陶瓷",
+        "object_type_guess": [
+          "器物"
+        ],
+        "visual_summary": "展柜中可见一件器物，轮廓较圆润，表面有浅色反光。",
+        "shape_features": [
+          "圆润轮廓",
+          "器物主体"
+        ],
+        "decoration_features": [
+          "表面反光",
+          "纹饰细节不清"
+        ],
+        "search_keywords": [
+          "陶瓷",
+          "器物",
+          "展柜",
+          "平顶山市博物馆"
+        ],
+        "is_clear": true,
+        "confidence": 0.65,
+        "risk": "mock 默认视觉描述，未判断具体展品名称"
+      },
+      "error_type": "",
+      "error": "",
+      "elapsed_ms": 0
+    },
+    {
+      "candidate_id": "denggong_gui",
+      "standard_name": "邓公簋",
+      "category": "青铜器",
+      "image_path": "data/museum_refs/denggong_gui/ref_1.jpg",
+      "exists": true,
+      "status": "ok",
+      "vision_result": {
+        "category": "陶瓷",
+        "object_type_guess": [
+          "器物"
+        ],
+        "visual_summary": "展柜中可见一件器物，轮廓较圆润，表面有浅色反光。",
+        "shape_features": [
+          "圆润轮廓",
+          "器物主体"
+        ],
+        "decoration_features": [
+          "表面反光",
+          "纹饰细节不清"
+        ],
+        "search_keywords": [
+          "陶瓷",
+          "器物",
+          "展柜",
+          "平顶山市博物馆"
+        ],
+        "is_clear": true,
+        "confidence": 0.65,
+        "risk": "mock 默认视觉描述，未判断具体展品名称"
+      },
+      "error_type": "",
+      "error": "",
+      "elapsed_ms": 0
+    },
+    {
+      "candidate_id": "lushan_huaci_sanzuxi",
+      "standard_name": "黑釉蓝斑花口三足洗",
+      "category": "陶瓷",
+      "image_path": "data/museum_refs/lushan_huaci_sanzuxi/ref_1.jpg",
+      "exists": true,
+      "status": "ok",
+      "vision_result": {
+        "category": "陶瓷",
+        "object_type_guess": [
+          "器物"
+        ],
+        "visual_summary": "展柜中可见一件器物，轮廓较圆润，表面有浅色反光。",
+        "shape_features": [
+          "圆润轮廓",
+          "器物主体"
+        ],
+        "decoration_features": [
+          "表面反光",
+          "纹饰细节不清"
+        ],
+        "search_keywords": [
+          "陶瓷",
+          "器物",
+          "展柜",
+          "平顶山市博物馆"
+        ],
+        "is_clear": true,
+        "confidence": 0.65,
+        "risk": "mock 默认视觉描述，未判断具体展品名称"
+      },
+      "error_type": "",
+      "error": "",
+      "elapsed_ms": 0
+    },
+    {
+      "candidate_id": "shuyao_chuilinwen_shengding",
+      "standard_name": "束腰垂鳞纹升鼎",
+      "category": "青铜器",
+      "image_path": "data/museum_refs/shuyao_chuilinwen_shengding/ref_1.jpg",
+      "exists": true,
+      "status": "ok",
+      "vision_result": {
+        "category": "陶瓷",
+        "object_type_guess": [
+          "器物"
+        ],
+        "visual_summary": "展柜中可见一件器物，轮廓较圆润，表面有浅色反光。",
+        "shape_features": [
+          "圆润轮廓",
+          "器物主体"
+        ],
+        "decoration_features": [
+          "表面反光",
+          "纹饰细节不清"
+        ],
+        "search_keywords": [
+          "陶瓷",
+          "器物",
+          "展柜",
+          "平顶山市博物馆"
+        ],
+        "is_clear": true,
+        "confidence": 0.65,
+        "risk": "mock 默认视觉描述，未判断具体展品名称"
+      },
+      "error_type": "",
+      "error": "",
+      "elapsed_ms": 0
+    }
+  ]
+}

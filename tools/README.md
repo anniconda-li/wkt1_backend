@@ -7,7 +7,7 @@ tools 目录当前只保留常用测试和维护脚本。
 - `test_ai_audio_loop.py`
 
   当前主测试脚本。用于测试：
-  问题文本 -> TTS -> ASR -> Dify -> TTS -> reply.wav
+  问题文本 -> TTS -> ASR -> 百炼智能体应用 -> TTS -> reply.wav
 
   运行：
 
@@ -18,12 +18,6 @@ tools 目录当前只保留常用测试和维护脚本。
 - `test_asr_file.py`
 
   如果存在，用于测试本地 WAV 文件 ASR。
-
-## dify
-
-- `test_dify_service.py`
-
-  用于单独测试 Dify Workflow。
 
 ## maintenance
 

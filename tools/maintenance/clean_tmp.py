@@ -1,29 +1,18 @@
 from __future__ import annotations
 
-import shutil
 import sys
-from pathlib import Path
+
+from core.paths import DEFAULT_CAMERA_TEST_IMAGE, RUNTIME_DIRS, TMP_DIR, ensure_project_dirs
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-TMP_DIR = PROJECT_ROOT / "tmp"
-LATEST_DIR = TMP_DIR / "latest"
-RUNS_DIR = TMP_DIR / "runs"
-
-
-def remove_path(path: Path) -> None:
-    if path.is_dir():
-        shutil.rmtree(path)
-    elif path.exists():
-        path.unlink()
-
-
-def main() -> None:
-    for path in (LATEST_DIR, RUNS_DIR):
-        remove_path(path)
-    LATEST_DIR.mkdir(parents=True, exist_ok=True)
-    RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    print("[OK] tmp cleaned")
+def main() -> int:
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_project_dirs()
+    print("[OK] tmp/project directories ensured")
+    print(f"[OK] runtime_dirs={len(RUNTIME_DIRS)}")
+    print(f"[OK] default_test_image={DEFAULT_CAMERA_TEST_IMAGE}")
+    print("[INFO] no files were deleted")
+    return 0
 
 
 if __name__ == "__main__":

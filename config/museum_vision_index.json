@@ -1,0 +1,171 @@
+{
+  "yingguo_yuying": {
+    "candidate_id": "yingguo_yuying",
+    "standard_name": "应国玉鹰",
+    "aliases": [
+      "白玉线雕鹰",
+      "西周白玉线雕鹰",
+      "玉鹰"
+    ],
+    "category": "玉器",
+    "reference_image_used": "data/museum_refs/yingguo_yuying/ref_1.jpg",
+    "detailed_visual_description": "该文物为一件玉质雕刻品，整体呈鹰的形态，造型简洁而富有动感。鹰的双翼展开，边缘圆润，尾部微微上翘。身体部分雕刻有流畅的线条，表现出羽毛的层次感和纹理细节。头部略微抬起，喙部清晰可见，眼睛位置未明确刻画。材质为浅黄色至米白色玉石，表面光滑莹润，局部带有自然的褐色沁色，尤其在鹰的背部和尾部较为明显。整体雕刻工艺精细，线条流畅，具有典型的古代玉器风格。",
+    "visual_keywords": [
+      "玉器",
+      "鹰形",
+      "双翼展开",
+      "线雕",
+      "羽毛纹理",
+      "头部微抬",
+      "喙部清晰",
+      "褐色沁色",
+      "光滑莹润",
+      "古代风格"
+    ],
+    "name_constraints": [
+      "应国玉鹰",
+      "白玉线雕鹰",
+      "西周白玉线雕鹰",
+      "玉鹰"
+    ],
+    "generated_at": "2026-06-07T04:06:16+00:00",
+    "parse_ok": true,
+    "error": ""
+  },
+  "panlongniu_daigai_tonghe": {
+    "candidate_id": "panlongniu_daigai_tonghe",
+    "standard_name": "盘龙钮带盖铜盉",
+    "aliases": [
+      "带盖铜盉",
+      "铜盉",
+      "西周铜盉"
+    ],
+    "category": "青铜器",
+    "reference_image_used": "data/museum_refs/panlongniu_daigai_tonghe/ref_1.jpg",
+    "detailed_visual_description": "这件青铜器整体呈三足鼎立形态，器身圆润饱满，表面覆盖着一层绿色的铜锈，显现出岁月的痕迹。器盖顶部装饰有一个盘龙形状的钮，龙头昂首，姿态生动。器身一侧有一条长而弯曲的龙形流，龙首探出，栩栩如生。另一侧有龙形把手，造型与流相呼应。器身中部环绕着一圈复杂的纹饰带，纹样精细且对称，具有典型的古代青铜器风格。整体结构稳固，细节处理精致，展现出古代工匠的高超技艺。",
+    "visual_keywords": [
+      "青铜器",
+      "盘龙钮",
+      "带盖铜盉",
+      "三足鼎立",
+      "绿色铜锈",
+      "龙形流",
+      "龙形把手",
+      "复杂纹饰",
+      "古代工艺",
+      "器盖顶部",
+      "龙头昂首",
+      "对称纹样"
+    ],
+    "name_constraints": [
+      "只能使用标准名称或别名",
+      "不得自造名称"
+    ],
+    "generated_at": "2026-06-07T04:06:22+00:00",
+    "parse_ok": true,
+    "error": ""
+  },
+  "denggong_gui": {
+    "candidate_id": "denggong_gui",
+    "standard_name": "邓公簋",
+    "aliases": [
+      "西周邓公簋",
+      "青铜簋"
+    ],
+    "category": "青铜器",
+    "reference_image_used": "data/museum_refs/denggong_gui/ref_1.jpg",
+    "detailed_visual_description": "该文物为一件青铜材质的古代容器，整体呈圆形，具有盖子和底座。器身由多层横向凸起的弦纹构成，表面覆盖着绿色的铜锈，显示出年代感。盖顶中央有一个圆形凸起，边缘有细致的几何纹饰。器身两侧各有一个兽首形环耳，耳部造型生动，带有环状把手。盖与器身连接处及底部均有复杂的云雷纹或卷曲纹样装饰，纹路清晰且富有层次感。整体造型庄重，工艺精湛，体现了古代青铜器的典型特征。",
+    "visual_keywords": [
+      "青铜器",
+      "圆形",
+      "带盖",
+      "弦纹",
+      "铜锈",
+      "兽首耳",
+      "环耳",
+      "云雷纹",
+      "卷曲纹",
+      "凸起纹饰",
+      "对称结构",
+      "古代工艺",
+      "器物形态",
+      "装饰细节"
+    ],
+    "name_constraints": [
+      "邓公簋",
+      "西周邓公簋",
+      "青铜簋"
+    ],
+    "generated_at": "2026-06-07T04:06:28+00:00",
+    "parse_ok": true,
+    "error": ""
+  },
+  "lushan_huaci_sanzuxi": {
+    "candidate_id": "lushan_huaci_sanzuxi",
+    "standard_name": "黑釉蓝斑花口三足洗",
+    "aliases": [
+      "鲁山花瓷",
+      "花瓷",
+      "黑釉蓝斑三足洗"
+    ],
+    "category": "陶瓷",
+    "reference_image_used": "data/museum_refs/lushan_huaci_sanzuxi/ref_1.jpg",
+    "detailed_visual_description": "该文物为一件黑釉蓝斑花口三足洗，整体呈敞口弧腹造型，口沿不规则呈花瓣状。器身主体为深黑色釉面，表面带有自然流淌的蓝色斑纹，釉色光亮且富有层次感。底部有三个兽首形足，造型古朴，腿部细节雕刻清晰，呈现出金属质感。器物内外壁可见釉料垂流和窑变效果，边缘部分露胎，显现出胎体的灰褐色质地。",
+    "visual_keywords": [
+      "黑釉",
+      "蓝斑",
+      "花口",
+      "三足",
+      "兽首足",
+      "敞口",
+      "弧腹",
+      "釉面光亮",
+      "窑变",
+      "露胎",
+      "花瓣口",
+      "金属质感",
+      "古朴造型",
+      "釉料垂流"
+    ],
+    "name_constraints": [
+      "黑釉蓝斑花口三足洗",
+      "鲁山花瓷",
+      "花瓷",
+      "黑釉蓝斑三足洗"
+    ],
+    "generated_at": "2026-06-07T04:06:34+00:00",
+    "parse_ok": true,
+    "error": ""
+  },
+  "shuyao_chuilinwen_shengding": {
+    "candidate_id": "shuyao_chuilinwen_shengding",
+    "standard_name": "束腰垂鳞纹升鼎",
+    "aliases": [
+      "升鼎",
+      "青铜鼎"
+    ],
+    "category": "青铜器",
+    "reference_image_used": "data/museum_refs/shuyao_chuilinwen_shengding/ref_1.jpg",
+    "detailed_visual_description": "这是一件束腰垂鳞纹升鼎，整体呈圆形敞口，腹部向内收束形成束腰状，底部由三足支撑。器物表面覆盖着深绿色的铜锈，显现出青铜材质的古朴质感。腹部饰有规则排列的垂鳞纹，纹路细腻且富有层次感。两侧各有一个向外弯曲的环形耳，耳部边缘圆润。器腹中部对称装饰有两个兽首形环耳，下方悬挂一个环形提梁，提梁上亦有精细纹饰。三足为粗壮的兽蹄形，底部略宽，与器身连接处有凸起的装饰带。整体造型庄重典雅，细节丰富。",
+    "visual_keywords": [
+      "束腰",
+      "垂鳞纹",
+      "环形耳",
+      "兽首环耳",
+      "提梁",
+      "三足",
+      "兽蹄形",
+      "铜锈",
+      "青铜材质",
+      "对称装饰",
+      "古朴质感",
+      "细节丰富"
+    ],
+    "name_constraints": [
+      "只能使用标准名称“束腰垂鳞纹升鼎”或别名“升鼎”、“青铜鼎”进行检索"
+    ],
+    "generated_at": "2026-06-07T04:06:39+00:00",
+    "parse_ok": true,
+    "error": ""
+  }
+}
