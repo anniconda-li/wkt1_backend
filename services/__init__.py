@@ -7,4 +7,5 @@
 - vision_service: 视觉识别服务，基于多模态大模型分析展品图片
 - photo_guide_service: 拍照导游服务，根据视觉结果生成导游讲解
 - voice_qa_service: 语音问答服务，将 ASR→LLM→TTS 串联为完整链路
+- ai_session_store: AI 语音问答会话状态和线程安全存储
 """

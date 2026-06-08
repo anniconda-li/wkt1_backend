@@ -34,8 +34,6 @@ import os
 import socket
 import threading
 import time
-import uuid
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -60,6 +58,14 @@ from server.media import (
     validate_and_log_wav,
 )
 from server.protocol import PKT_TYPES, make_server_echo, parse_packet
+from services.ai_session_store import (
+    AiSession,
+    AiSessionStore,
+    canceled_response,
+    canceled_result_info,
+    is_session_canceled,
+    mark_session_canceled,
+)
 from services.photo_guide_service import PhotoGuideService, RETAKE_MODE, choose_mode, response_payload
 from services.asr_service import transcribe_wav
 from services.voice_qa_service import FIXED_ANSWER, VoiceQaService
@@ -85,41 +91,6 @@ DEFAULT_AI_REPLY_REPEAT = 1
 DEFAULT_AI_REPLY_EXTRA_CHUNK = False
 
 logger = logging.getLogger(__name__)
-
-
-# =============================================================================
-# 数据结构定义
-# =============================================================================
-
-@dataclass
-class AiSession:
-    """AI 语音问答会话状态。
-
-    跟踪一次 ASR → LLM → TTS 全链路中各个环节的状态。
-    """
-    session_id: str                           # 会话 ID
-    chunks: bytearray | None = None           # 接收缓冲
-    total: int = 0                            # 总字节数
-    received: int = 0                         # 已接收字节数
-    reply: bytes | None = None                # TTS 合成的回复音频
-    save_path: Path | None = None             # 上传 WAV 保存路径
-    device: str = "walkie-01"                 # 设备标识
-    language: str = "zh"                      # 语言代码
-    question_text: str = ""                   # 用户问题文本
-    answer_text: str = ""                     # AI 回答文本
-    asr_text: str = ""                        # ASR 识别文本
-    image_context: str = ""                   # 图片上下文信息
-    upload_wav_path: Path | None = None       # 上传 WAV 路径
-    reply_path: Path | None = None            # 回复音频路径
-    status: str = "started"                   # 会话状态
-    audio_ready: bool = False                 # 音频是否就绪
-    reply_wav_ready: bool = False             # 回复 WAV 是否就绪
-    reply_wav_size: int = 0                   # 回复 WAV 大小
-    reply_duration: float = 0.0               # 回复音频时长（秒）
-    tts_status: str = "idle"                  # TTS 状态
-    tts_error: str | None = None              # TTS 错误信息
-    tts_task: asyncio.Task | None = None      # 后台 TTS 异步任务
-    canceled: bool = False                    # 是否已取消
 
 
 # =============================================================================
@@ -229,9 +200,10 @@ def create_http_app(
     # =========================================================================
     app.state.save_dir = wav_save_dir
     app.state.jpg_save_dir = jpg_save_dir
-    # AI 会话存储（线程安全）
-    app.state.ai_sessions = {}
-    app.state.ai_sessions_lock = threading.RLock()
+    # AI 会话状态集中在 store 中；下面两个别名兼容现有测试和调试脚本。
+    app.state.ai_session_store = AiSessionStore()
+    app.state.ai_sessions = app.state.ai_session_store.sessions
+    app.state.ai_sessions_lock = app.state.ai_session_store.lock
     # 最近相机图片缓存
     app.state.latest_images = {}
     app.state.latest_image_analysis = {}
@@ -255,55 +227,10 @@ def create_http_app(
 
     def get_session(session_id: str) -> AiSession:
         """获取会话，不存在时抛出 404。"""
-        with app.state.ai_sessions_lock:
-            session = app.state.ai_sessions.get(session_id)
-            if session is None:
-                raise HTTPException(status_code=404, detail={"ok": False, "error": "unknown session"})
-            return session
-
-    def is_session_canceled(ai_session: AiSession) -> bool:
-        """检查会话是否已取消。"""
-        return ai_session.canceled or ai_session.status == "canceled"
-
-    def mark_session_canceled(ai_session: AiSession) -> None:
-        """标记会话为已取消状态，清空音频相关标志。"""
-        ai_session.canceled = True
-        ai_session.status = "canceled"
-        ai_session.audio_ready = False
-        ai_session.reply_wav_ready = False
-        ai_session.reply_wav_size = 0
-        ai_session.reply_duration = 0.0
-        ai_session.tts_status = "canceled"
-        ai_session.tts_error = None
-
-    def canceled_result_info(session_id: str, ai_session: AiSession) -> dict[str, object]:
-        """返回已取消会话的 result_info 响应。"""
-        return {
-            "ok": True,
-            "session": session_id,
-            "ready": False,
-            "total": 0,
-            "format": "wav",
-            "text": ai_session.answer_text,
-            "status": "canceled",
-            "asr_text": ai_session.asr_text,
-            "answer_text": ai_session.answer_text,
-            "audio_ready": False,
-            "reply_wav_ready": False,
-            "reply_wav_size": 0,
-            "reply_duration": 0,
-            "tts_status": "canceled",
-            "tts_error": None,
-        }
-
-    def canceled_response(session_id: str) -> dict[str, object]:
-        """返回取消操作的响应。"""
-        return {
-            "ok": True,
-            "session": session_id,
-            "status": "canceled",
-            "message": "session canceled",
-        }
+        session = app.state.ai_session_store.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail={"ok": False, "error": "unknown session"})
+        return session
 
     def reply_duration_seconds(reply: bytes) -> float:
         """计算 WAV 回复音频的时长（秒）。"""
@@ -690,13 +617,8 @@ def create_http_app(
                 log(f"AI start JSON 解析失败: {exc}，使用默认值")
         device = str(body_json.get("device") or "walkie-01")
         language = str(body_json.get("language") or "zh")
-        session_id = uuid.uuid4().hex[:12]
-        with app.state.ai_sessions_lock:
-            app.state.ai_sessions[session_id] = AiSession(
-                session_id=session_id,
-                device=device,
-                language=language,
-            )
+        ai_session = app.state.ai_session_store.create(device=device, language=language)
+        session_id = ai_session.session_id
         log(f"AI start session={session_id} device={device} language={language}")
         return {"session": session_id, "chunk_size": DEFAULT_CHUNK_SIZE}
 
@@ -713,17 +635,15 @@ def create_http_app(
         body = await request.body()
         await log_request(request, body, "cancel")
         log(f"取消请求 session={session}")
-        with app.state.ai_sessions_lock:
-            ai_session = app.state.ai_sessions.get(session)
-            if ai_session is None:
-                log(f"取消未知会话 session={session}")
-                return {
-                    "ok": False,
-                    "session": session,
-                    "status": "not_found",
-                    "error": "session not found",
-                }
-            mark_session_canceled(ai_session)
+        ai_session = app.state.ai_session_store.cancel(session)
+        if ai_session is None:
+            log(f"取消未知会话 session={session}")
+            return {
+                "ok": False,
+                "session": session,
+                "status": "not_found",
+                "error": "session not found",
+            }
         log(f"取消已接受 session={session}")
         return canceled_response(session)
 
