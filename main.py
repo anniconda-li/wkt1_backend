@@ -7,7 +7,7 @@
 
 启动方式：
     python main.py
-    或通过 uvicorn 直接启动：uvicorn main:app --host 0.0.0.0 --port 8000
+    或通过 uvicorn 直接启动：uvicorn main:app --host 0.0.0.0 --port 18080
 """
 
 from __future__ import annotations

@@ -76,13 +76,13 @@ pip install -r requirements.txt
 HTTP 服务可以直接交给 uvicorn 管理，适合部署到服务器、进程管理器或反向代理后面：
 
 ```powershell
-.\.venv\Scripts\python.exe -m uvicorn main:app --host 0.0.0.0 --port 8000
+.\.venv\Scripts\python.exe -m uvicorn main:app --host 0.0.0.0 --port 18080
 ```
 
 这个命令只启动 HTTP API：
 
 ```text
-HTTP: http://<PC_LAN_IP>:8000
+HTTP: http://<PC_LAN_IP>:18080
 ```
 
 健康检查：
@@ -95,14 +95,14 @@ GET /readyz
 如果设备还需要 UDP 实时对讲服务，使用完整设备入口：
 
 ```powershell
-.\.venv\Scripts\python.exe -m server.walkie_app --host 0.0.0.0 --http-port 8000 --udp-port 9000
+.\.venv\Scripts\python.exe -m server.walkie_app --host 0.0.0.0 --http-port 18080 --udp-port 19000
 ```
 
 服务启动后：
 
 ```text
-HTTP: http://<PC_LAN_IP>:8000
-UDP:  9000
+HTTP: http://<PC_LAN_IP>:18080
+UDP:  19000
 ```
 
 ESP32S3 固件中的 HTTP/UDP 地址应指向这台服务器的局域网 IP。
@@ -163,14 +163,14 @@ FFMPEG_BIN=ffmpeg
 ```bash
 cd /opt/wkt1_backend
 . .venv/bin/activate
-python -m server.walkie_app --host 0.0.0.0 --http-port 8000 --udp-port 9000
+python -m server.walkie_app --host 0.0.0.0 --http-port 18080 --udp-port 19000
 ```
 
 另开终端检查：
 
 ```bash
-curl http://127.0.0.1:8000/healthz
-curl http://127.0.0.1:8000/readyz
+curl http://127.0.0.1:18080/healthz
+curl http://127.0.0.1:18080/readyz
 ```
 
 创建 systemd 服务：
@@ -193,7 +193,7 @@ User=ubuntu
 Group=ubuntu
 WorkingDirectory=/opt/wkt1_backend
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/opt/wkt1_backend/.venv/bin/python -m server.walkie_app --host 0.0.0.0 --http-port 8000 --udp-port 9000
+ExecStart=/opt/wkt1_backend/.venv/bin/python -m server.walkie_app --host 0.0.0.0 --http-port 18080 --udp-port 19000
 Restart=always
 RestartSec=5
 
@@ -219,8 +219,8 @@ journalctl -u wkt1-backend -f
 如果启用了 UFW 防火墙，放开 HTTP 和 UDP 端口：
 
 ```bash
-sudo ufw allow 8000/tcp
-sudo ufw allow 9000/udp
+sudo ufw allow 18080/tcp
+sudo ufw allow 19000/udp
 sudo ufw status
 ```
 
@@ -237,7 +237,7 @@ sudo systemctl restart wkt1-backend
 如果只部署 HTTP API，不需要 UDP 实时对讲，可以把 systemd 里的 `ExecStart` 改为：
 
 ```ini
-ExecStart=/opt/wkt1_backend/.venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 8000
+ExecStart=/opt/wkt1_backend/.venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 18080
 ```
 
 ## 实时对讲
@@ -247,7 +247,7 @@ ExecStart=/opt/wkt1_backend/.venv/bin/python -m uvicorn main:app --host 0.0.0.0 
 默认端口：
 
 ```text
-UDP 9000
+UDP 19000
 ```
 
 设备侧需要保持 WTK1 UDP 协议格式。后端会记录注册、频道、PTT、音频、心跳等包，并可做本地回声测试。
