@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import socket
 
-from server.protocol import PKT_TYPES, make_server_echo, parse_packet
+from server.protocol import PKT_TYPES, parse_packet
 
 
 def run_udp(host: str, port: int, *, log_func=print) -> None:
@@ -43,13 +43,9 @@ def run_udp(host: str, port: int, *, log_func=print) -> None:
             targets = [
                 (dev, dev_addr)
                 for dev, (ip, port, channel) in devices.items()
-                if dev != packet.device and channel == packet.channel
+                if channel == packet.channel
                 for dev_addr in [(ip, port)]
             ]
-            if targets:
-                for dev, dev_addr in targets:
-                    sock.sendto(data, dev_addr)
-                    log_func(f"UDP 音频转发至 {dev}@{dev_addr[0]}:{dev_addr[1]}")
-            else:
-                # Single-device test mode: use a server device id so clients do not drop it.
-                sock.sendto(make_server_echo(data), addr)
+            for dev, dev_addr in targets:
+                sock.sendto(data, dev_addr)
+                log_func(f"UDP 音频转发至 {dev}@{dev_addr[0]}:{dev_addr[1]}")

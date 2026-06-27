@@ -41,6 +41,7 @@ class AiSession:
     tts_error: str | None = None
     tts_task: asyncio.Task | None = None
     canceled: bool = False
+    audio_stopped: bool = False
 
 
 class AiSessionStore:

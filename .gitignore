@@ -6,6 +6,9 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
 
 # Virtual environments and local secrets
 .venv/
@@ -18,6 +21,7 @@ ENV/
 
 # Runtime outputs
 tmp/
+photo/
 logs/
 *.log
 *.pid
@@ -28,6 +32,17 @@ logs/
 *.jpg
 *.jpeg
 *.png
+*.bin
+*.tmp
+
+# Build and packaging outputs
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Local review / scratch notes
+PROJECT_REVIEW.md
 
 # Keep curated test data
 !tests/

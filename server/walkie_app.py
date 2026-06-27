@@ -231,6 +231,10 @@ def create_http_app(
             if ai_session is None:
                 log(f"[TTS-BG] 会话不存在 session={session_id}")
                 return
+            if ai_session.audio_stopped:
+                ai_session.tts_status = "stopped"
+                log(f"TTS 跳过 因音频已停止 session={session_id}")
+                return
             if is_session_canceled(ai_session):
                 mark_session_canceled(ai_session)
                 log(f"TTS 跳过 因会话已取消 session={session_id}")
@@ -254,6 +258,10 @@ def create_http_app(
                     mark_session_canceled(ai_session)
                     log(f"TTS 结果因会话已取消而被忽略 session={session_id}")
                     return
+                if ai_session.audio_stopped:
+                    ai_session.tts_status = "stopped"
+                    log(f"TTS 结果因音频已停止而被忽略 session={session_id}")
+                    return
             if parse_wav(reply) is None:
                 raise RuntimeError("TTS 生成的回复 WAV 无效")
 
@@ -271,6 +279,10 @@ def create_http_app(
                 if is_session_canceled(ai_session):
                     mark_session_canceled(ai_session)
                     log(f"TTS 结果因会话已取消而被忽略 session={session_id}")
+                    return
+                if ai_session.audio_stopped:
+                    ai_session.tts_status = "stopped"
+                    log(f"TTS 结果因音频已停止而被忽略 session={session_id}")
                     return
                 ai_session.reply = reply
                 ai_session.reply_path = reply_path
@@ -313,6 +325,9 @@ def create_http_app(
             if is_session_canceled(ai_session):
                 mark_session_canceled(ai_session)
                 log(f"TTS 跳过 因会话已取消 session={ai_session.session_id}")
+                return
+            if ai_session.audio_stopped:
+                ai_session.tts_status = "stopped"
                 return
         if not ai_session.answer_text.strip():
             ai_session.tts_status = "disabled"
@@ -462,7 +477,13 @@ def create_http_app(
     # 相机视觉分析
     # =========================================================================
 
-    async def analyze_camera_observation(safe_device: str, image_id: str, image_path: Path) -> VisualDescription:
+    async def analyze_camera_observation(
+        safe_device: str,
+        image_id: str,
+        image_path: Path,
+        *,
+        background_search: bool = True,
+    ) -> VisualDescription:
         """分析相机上传的图片，缓存视觉描述，并异步触发 KB 检索。
 
         视觉分析和 KB 检索都在上传阶段完成，
@@ -509,7 +530,7 @@ def create_http_app(
         )
 
         # 图片清晰且类别可辨时，立即做 KB 检索（用户拍照到提问间隙完成）
-        if status == "ready":
+        if status == "ready" and background_search:
             asyncio.create_task(_background_search(safe_device, image_id, desc, cache_entry))
 
         return desc
@@ -654,6 +675,35 @@ def create_http_app(
             }
         log(f"取消已接受 session={session}")
         return canceled_response(session)
+
+    @app.post("/ai/stop_audio")
+    async def ai_stop_audio(request: Request, session: str = Query(...)) -> dict[str, object]:
+        """停止当前回复音频，不取消 session，也不清空 answer_text。"""
+        body = await request.body()
+        await log_request(request, body, "stop_audio")
+        ai_session = app.state.ai_session_store.get(session)
+        if ai_session is None:
+            log(f"stop_audio 未知会话 session={session}")
+            return {"ok": True, "session": session, "status": "audio_stopped"}
+
+        with app.state.ai_sessions_lock:
+            ai_session.audio_stopped = True
+            ai_session.audio_ready = False
+            ai_session.reply_wav_ready = False
+            ai_session.reply_wav_size = 0
+            ai_session.reply_duration = 0.0
+            ai_session.reply = None
+            ai_session.reply_path = None
+            ai_session.tts_status = "stopped"
+            ai_session.tts_error = None
+            if ai_session.answer_text and ai_session.status not in {"canceled", "audio_failed"}:
+                ai_session.status = "text_ready"
+            task = ai_session.tts_task
+
+        if task is not None and not task.done():
+            task.cancel()
+        log(f"stop_audio 已接受 session={session}")
+        return {"ok": True, "session": session, "status": "audio_stopped"}
 
     @app.post("/ai/upload")
     async def ai_upload(
@@ -806,6 +856,7 @@ def create_http_app(
             ai_session.reply_path = None
             ai_session.reply_wav_size = 0
             ai_session.reply_duration = 0.0
+            ai_session.audio_stopped = False
             ai_session.tts_error = None
             ai_session.tts_status = "pending" if answer_text.strip() and auto_tts_background_enabled() else "disabled"
         log(f"[AI] text_ready session={session} answer_chars={len(answer_text)}")
@@ -842,6 +893,9 @@ def create_http_app(
                     else len(ai_session.reply or b"")
                 )
                 ai_session.reply_wav_size = reply_len
+            tts_status = ai_session.tts_status
+            if tts_status in {"pending", "running"}:
+                tts_status = "processing"
             return {
                 "ok": True,
                 "session": session,
@@ -856,7 +910,7 @@ def create_http_app(
                 "reply_wav_ready": ai_session.reply_wav_ready,
                 "reply_wav_size": ai_session.reply_wav_size,
                 "reply_duration": ai_session.reply_duration,
-                "tts_status": ai_session.tts_status,
+                "tts_status": tts_status,
                 "tts_error": ai_session.tts_error,
             }
 
@@ -885,12 +939,18 @@ def create_http_app(
                     {"ok": False, "status": "canceled", "error": "session canceled"},
                     status_code=409,
                 )
+            if ai_session.audio_stopped:
+                log(f"result_chunk 被拒绝 因音频已停止 session={session}")
+                return JSONResponse(
+                    {"ok": False, "status": "audio_stopped", "error": "audio stopped"},
+                    status_code=409,
+                )
             if ai_session.reply is None:
                 return Response(b"not ready", status_code=409, media_type="text/plain")
             reply_path = ai_session.reply_path
             reply_bytes = ai_session.reply
         reply = reply_path.read_bytes() if reply_path and reply_path.exists() else reply_bytes
-        if offset < 0 or len_ <= 0 or offset >= len(reply):
+        if offset < 0 or len_ <= 0 or offset + len_ > len(reply):
             return Response(b"range invalid", status_code=416, media_type="text/plain")
         chunk = reply[offset : offset + len_]
         log(f"AI result_chunk session={session} offset={offset} len={len(chunk)}")
@@ -950,11 +1010,63 @@ def create_http_app(
         }
         log(f"Camera 最新图片已更新 device={safe_device} image_id={image_id} file={save_path}")
 
-        # 视觉分析（只输出视觉描述，不匹配文物）
-        desc = await analyze_camera_observation(safe_device, image_id, save_path)
+        # 视觉分析。设备端不会轮询图片状态，因此这里在返回前给出最终分析结果。
+        desc = await analyze_camera_observation(safe_device, image_id, save_path, background_search=False)
         need_retake = not desc.is_clear or desc.category in ("无法判断", "未知")
+        if need_retake:
+            answer_text = "这张照片信息不太够。请把展品放在画面中间，靠近一点，避开展柜反光后重拍。"
+            response_data = {
+                "ok": True,
+                "analysis_ok": False,
+                "answer_text": answer_text,
+                "len": len(body),
+                "width": width,
+                "height": height,
+                "file": save_path.as_posix(),
+                "device": safe_device,
+                "image_id": image_id,
+                "category": desc.category,
+                "is_clear": desc.is_clear,
+                "confidence": desc.confidence,
+                "visual_description": desc.visual_description,
+                "shape_features": desc.shape_features,
+                "decoration_features": desc.decoration_features,
+                "color_material": desc.color_material,
+                "search_keywords": desc.search_keywords,
+                "risk": desc.risk,
+                "need_retake": True,
+            }
+            return JSONResponse(response_data)
+
+        try:
+            search_start = time.perf_counter()
+            match = await app.state.artifact_search.search_async(desc)
+            log(
+                f"[CAMERA] KB检索(上传同步) image_id={image_id} "
+                f"match_id={match.match_id} confidence={match.confidence:.2f} "
+                f"cost={time.perf_counter() - search_start:.3f}s"
+            )
+        except Exception as exc:
+            logger.exception("[CAMERA] KB检索失败 device=%s image_id=%s", safe_device, image_id)
+            match = ArtifactMatchResult(evidence=f"检索异常: {exc}")
+
+        guide_start = time.perf_counter()
+        guide = await app.state.photo_guide_service.build_answer_async(
+            desc, match, device=safe_device, image_id=image_id,
+        )
+        log(
+            f"[CAMERA] 上传导游讲解 image_id={image_id} mode={guide.mode} "
+            f"grounded={int(guide.grounded)} answer_chars={len(guide.answer_text)} "
+            f"cost={time.perf_counter() - guide_start:.3f}s"
+        )
+
+        cached = app.state.latest_visual_descriptions.get(safe_device)
+        if isinstance(cached, dict) and cached.get("image_id") == image_id:
+            cached["match"] = match
+
         response_data = {
             "ok": True,
+            "analysis_ok": guide.mode != RETAKE_MODE,
             "len": len(body),
             "width": width,
             "height": height,
@@ -970,10 +1082,14 @@ def create_http_app(
             "color_material": desc.color_material,
             "search_keywords": desc.search_keywords,
             "risk": desc.risk,
-            "need_retake": need_retake,
-            "answer_text": ""
-            if not need_retake
-            else "这张照片信息不太够。请把展品放在画面中间，靠近一点，避开展柜反光后重拍。",
+            "need_retake": guide.mode == RETAKE_MODE,
+            "mode": guide.mode,
+            "match_id": match.match_id,
+            "match_name": match.match_name,
+            "evidence": match.evidence,
+            "grounded": guide.grounded,
+            "gate_reason": guide.gate_reason,
+            "answer_text": guide.answer_text,
         }
         return JSONResponse(response_data)
 
