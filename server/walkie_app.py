@@ -15,7 +15,7 @@ AI 语音问答流程（/ai/* 接口）：
   6. /ai/cancel  — 取消会话
 
 相机拍照讲解流程（/camera/* 接口）：
-  1. /camera/upload        — 上传 JPEG 图片，自动触发视觉分析和导游讲解
+  1. /camera/upload        — 上传 JPEG 图片，触发视觉分析和文物检索并缓存结果
   2. /camera/analyze_latest — 对最新上传图片进行分析并返回导游讲解
 
 UDP 协议：
@@ -65,7 +65,7 @@ from services.ai_session_store import (
     mark_session_canceled,
 )
 from services.artifact_search_service import ArtifactMatchResult, ArtifactSearchService
-from services.photo_guide_service import PhotoGuideResult, PhotoGuideService, RETAKE_MODE, response_payload
+from services.photo_guide_service import PhotoGuideResult, PhotoGuideService, response_payload
 from services.asr_service import transcribe_wav
 from services.voice_qa_service import FIXED_ANSWER, VoiceQaService
 from services.tts_service import ERROR_TEXT, synthesize_wav_16k
@@ -968,11 +968,11 @@ def create_http_app(
     ) -> JSONResponse:
         """相机 JPEG 图片上传接口。
 
-        上传后自动触发：
+        上传后同步完成：
         1. 图片验证和保存
         2. 视觉分析（VisionService）
-        3. 导游讲解生成（PhotoGuideService）
-        4. 返回分析结果和讲解文本
+        3. 文物检索（ArtifactSearchService，本地优先，必要时百炼兜底）
+        4. 缓存视觉描述和检索结果，等待用户语音提问时再生成导游讲解
 
         参数：
         - device: 设备标识（默认 walkie-01）
@@ -1050,23 +1050,14 @@ def create_http_app(
             logger.exception("[CAMERA] KB检索失败 device=%s image_id=%s", safe_device, image_id)
             match = ArtifactMatchResult(evidence=f"检索异常: {exc}")
 
-        guide_start = time.perf_counter()
-        guide = await app.state.photo_guide_service.build_answer_async(
-            desc, match, device=safe_device, image_id=image_id,
-        )
-        log(
-            f"[CAMERA] 上传导游讲解 image_id={image_id} mode={guide.mode} "
-            f"grounded={int(guide.grounded)} answer_chars={len(guide.answer_text)} "
-            f"cost={time.perf_counter() - guide_start:.3f}s"
-        )
-
         cached = app.state.latest_visual_descriptions.get(safe_device)
         if isinstance(cached, dict) and cached.get("image_id") == image_id:
             cached["match"] = match
 
         response_data = {
             "ok": True,
-            "analysis_ok": guide.mode != RETAKE_MODE,
+            "analysis_ok": True,
+            "answer_text": "图片处理完成，可以提问了。",
             "len": len(body),
             "width": width,
             "height": height,
@@ -1082,14 +1073,12 @@ def create_http_app(
             "color_material": desc.color_material,
             "search_keywords": desc.search_keywords,
             "risk": desc.risk,
-            "need_retake": guide.mode == RETAKE_MODE,
-            "mode": guide.mode,
+            "need_retake": False,
             "match_id": match.match_id,
             "match_name": match.match_name,
             "evidence": match.evidence,
-            "grounded": guide.grounded,
-            "gate_reason": guide.gate_reason,
-            "answer_text": guide.answer_text,
+            "match_confidence": match.confidence,
+            "search_provider": getattr(match, "provider", ""),
         }
         return JSONResponse(response_data)
 
