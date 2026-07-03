@@ -21,8 +21,9 @@ from typing import Any
 FALLBACK_TEXT = "不好意思，导游服务响应超时，请再问一次。"
 # 默认 API 基础地址
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com"
-# 默认请求超时（秒）
-DEFAULT_TIMEOUT = 30
+# 默认请求超时（秒）。百炼应用偶发响应较慢，语音链路里宁可等到
+# 一个明确回答，也不要在 30 秒边界上频繁降级。
+DEFAULT_TIMEOUT = 60
 
 logger = logging.getLogger(__name__)
 

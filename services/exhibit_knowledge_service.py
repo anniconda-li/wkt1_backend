@@ -38,7 +38,7 @@ class ExhibitCard:
     source_urls: list[str] = field(default_factory=list)
     do_not_say: list[str] = field(default_factory=list)
 
-    def to_prompt_context(self) -> str:
+    def to_prompt_context(self, user_question: str = "") -> str:
         """Return a compact, source-grounded context block for the LLM."""
         basic = "；".join(f"{key}:{value}" for key, value in self.basic_info.items() if value)
         lines = [
@@ -57,21 +57,28 @@ class ExhibitCard:
         if self.guide_text:
             lines.append(f"讲解资料：{self.guide_text}")
         if self.visual_points:
-            lines.append(f"视觉看点：{'、'.join(self.visual_points[:12])}")
-        if self.history_notes:
-            lines.append(f"历史背景：{'、'.join(self.history_notes[:8])}")
-        if self.talking_points:
-            lines.append(f"可讲要点：{'、'.join(self.talking_points[:8])}")
-        if self.faq:
+            lines.append(f"视觉看点：{'、'.join(self.visual_points[:3] if _is_identity_question(user_question) else self.visual_points[:6])}")
+        if _is_identity_question(user_question):
+            if self.do_not_say:
+                lines.append(f"禁止编造：{'、'.join(self.do_not_say[:3])}")
+            return "\n".join(lines)
+        history_notes = _select_relevant(self.history_notes, user_question, limit=3)
+        if history_notes:
+            lines.append(f"历史背景：{'、'.join(history_notes)}")
+        talking_points = _select_relevant(self.talking_points, user_question, limit=4)
+        if talking_points:
+            lines.append(f"可讲要点：{'、'.join(talking_points)}")
+        faq = _select_relevant_faq(self.faq, user_question, limit=4)
+        if faq:
             faq_text = "；".join(
                 f"问：{item['question']} 答：{item['answer']}"
-                for item in self.faq[:10]
+                for item in faq
                 if item.get("question") and item.get("answer")
             )
             if faq_text:
                 lines.append(f"常见追问：{faq_text}")
         if self.do_not_say:
-            lines.append(f"禁止编造：{'、'.join(self.do_not_say[:8])}")
+            lines.append(f"禁止编造：{'、'.join(self.do_not_say[:5])}")
         return "\n".join(lines)
 
 
@@ -229,3 +236,69 @@ def _faq_list(value: Any) -> list[dict[str, str]]:
         if question and answer:
             items.append({"question": question, "answer": answer})
     return items
+
+
+def _select_relevant(items: list[str], query: str, *, limit: int) -> list[str]:
+    if not items:
+        return []
+    ranked = sorted(
+        enumerate(items),
+        key=lambda pair: (-_relevance_score(pair[1], query), pair[0]),
+    )
+    return [item for _, item in ranked[:limit]]
+
+
+def _select_relevant_faq(
+    items: list[dict[str, str]],
+    query: str,
+    *,
+    limit: int,
+) -> list[dict[str, str]]:
+    if not items:
+        return []
+    ranked = sorted(
+        enumerate(items),
+        key=lambda pair: (
+            -_relevance_score(
+                f"{pair[1].get('question', '')} {pair[1].get('answer', '')}",
+                query,
+            ),
+            pair[0],
+        ),
+    )
+    return [item for _, item in ranked[:limit]]
+
+
+def _relevance_score(text: str, query: str) -> int:
+    query = (query or "").strip()
+    if not query:
+        return 0
+    text = text or ""
+    score = 0
+    for keyword in _query_keywords(query):
+        if keyword and keyword in text:
+            score += 4
+    score += len((set(query) - set("这是什么的吗呢啊一件一个它")) & set(text))
+    return score
+
+
+def _query_keywords(query: str) -> list[str]:
+    groups = {
+        ("用", "用途", "干什么", "做什么", "作用"): ["用途", "性质", "佩", "盛", "酒", "水器", "礼器", "工具"],
+        ("年代", "时候", "朝代", "时期"): ["时代", "西周", "春秋", "唐代", "年代", "时期"],
+        ("材质", "材料", "什么做", "玉", "铜", "瓷"): ["材质", "白玉", "青铜", "陶瓷", "釉"],
+        ("出土", "哪里", "在哪", "地方"): ["出土", "墓", "应国", "许国", "叶县", "平顶山"],
+        ("名字", "为什么叫", "叫法", "名称"): ["叫", "名称", "束腰", "垂鳞纹", "盘龙钮", "线雕", "花口"],
+        ("故事", "历史", "重要", "特别", "讲讲", "介绍"): ["历史", "重要", "文化", "关系", "贵族", "礼制", "鹰城"],
+        ("看", "特征", "认出", "识别"): ["看", "特征", "视觉", "纹", "造型", "器身", "双耳", "三足"],
+    }
+    keywords = [query]
+    for triggers, additions in groups.items():
+        if any(trigger in query for trigger in triggers):
+            keywords.extend(additions)
+    return keywords
+
+
+def _is_identity_question(query: str) -> bool:
+    query = (query or "").strip()
+    return any(token in query for token in ("这是什么", "叫什么", "它是什么", "这个是", "这件是"))

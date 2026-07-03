@@ -143,26 +143,22 @@ class GuideAnswerService:
         *,
         user_question: str,
     ) -> str:
-        confidence_note = (
-            "匹配置信度中等，请使用'很像/可能是/建议以现场说明为准'这类保守措辞。"
-            if match.confidence < 0.8
-            else '可以说"很可能是"，但不要说成绝对确定。'
-        )
-        card_context = card.to_prompt_context() if card else "本地文物卡片缺失，只能依据视觉特征做保守讲解。"
+        cleaned_question = _clean(user_question) or "这是什么"
+        card_context = card.to_prompt_context(cleaned_question) if card else "本地文物卡片缺失，只能依据视觉特征做保守讲解。"
         visible_features = "、".join(
-            desc.shape_features[:4] + desc.decoration_features[:4] + desc.color_material[:4]
+            desc.shape_features[:3] + desc.decoration_features[:2] + desc.color_material[:2]
         ) or desc.visual_description[:120]
+        confidence_hint = "中等，需保守表达" if match.confidence < 0.8 else "较高，但不要绝对化"
+        evidence = _short_text(match.evidence or "视觉特征吻合", 140)
         return (
-            "你是平顶山市博物馆语音导游。请只根据下面的本地资料和照片可见信息回答，资料没有的不要编造。\n"
-            "先直接回答游客问题；如果问题很泛，再做简短讲解。能用常见追问资料时优先使用它。\n"
-            "回答要适合设备语音播报，80到170字，不要 Markdown，不要项目符号。\n\n"
-            f"{card_context}\n\n"
-            f"视觉匹配：{match.match_name}，置信度 {match.confidence:.2f}，依据：{match.evidence or '视觉特征吻合'}。\n"
-            f"游客问题：{_clean(user_question) or '这是什么'}。\n"
+            "请根据以下本轮数据生成最终语音导游回答。\n\n"
+            f"游客问题：{cleaned_question}。\n"
+            f"本轮回答策略：{_answer_style(cleaned_question)}。\n"
+            f"视觉匹配：{match.match_name}；置信度：{match.confidence:.2f}；可靠性：{confidence_hint}。\n"
+            f"匹配依据：{evidence}。\n"
             f"照片可见特征：{visible_features}。\n"
             f"不确定因素：{desc.risk or '无'}。\n"
-            f"{confidence_note}\n"
-            "不要出现'根据知识库'、'检索结果显示'这类技术说法。"
+            f"本地文物资料：\n{card_context}"
         )
 
     def _fallback_specific(
@@ -248,13 +244,16 @@ def guide_response_payload(
 def _category_prompt(desc: VisualDescription, *, user_question: str) -> str:
     themes = CATEGORY_THEMES.get(desc.category, "平顶山博物馆展览主题")
     features = "、".join(desc.shape_features[:3] + desc.decoration_features[:3]) or "无"
+    cleaned_question = _clean(user_question) or "这是什么"
     return (
-        f"游客拍到的具体文物名称暂时无法确认，不能编造具体文物名称。\n"
-        f"游客问题：{_clean(user_question) or '这是什么'}。\n"
-        f'请围绕"{desc.category}"这类展品讲怎么看，并尽量结合相关主题：{themes}。\n'
+        "请根据以下本轮数据生成最终语音导游回答。\n\n"
+        "具体文物名称：暂未确认。\n"
+        f"游客问题：{cleaned_question}。\n"
+        f"本轮回答策略：{_answer_style(cleaned_question)}。\n"
+        f"可讲类别：{desc.category}。\n"
+        f"相关主题：{themes}。\n"
         f"照片可见特征：{features}。\n"
-        f"不确定因素：{desc.risk or '无'}。\n"
-        "回答适合语音播报，50到120字，不要Markdown，不要项目符号，不要说识别失败。"
+        f"不确定因素：{desc.risk or '无'}。"
     )
 
 
@@ -276,5 +275,21 @@ def _is_valid(answer: str) -> bool:
 
 def _clean(answer: str) -> str:
     return " ".join((answer or "").strip().split())
+
+
+def _answer_style(question: str) -> str:
+    question = question or ""
+    if any(token in question for token in ("这是什么", "叫什么", "它是什么", "这个是", "这件是")):
+        return "简单识别问题，1到2句话，通常不需要追问引导"
+    if any(token in question for token in ("故事", "历史", "讲讲", "介绍", "详细", "为什么重要", "特别")):
+        return "展开型问题，可讲背景、重要性和看点，可自然给一个相关追问"
+    return "单点问题，2到4句话，直接回答，可不引导"
+
+
+def _short_text(text: str, limit: int) -> str:
+    text = _clean(text)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}..."
 
 
