@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """WTK1 对讲机后端服务 —— FastAPI HTTP + UDP 服务器。
 
 功能概述：
@@ -15,7 +15,7 @@ AI 语音问答流程（/ai/* 接口）：
   6. /ai/cancel  — 取消会话
 
 相机拍照讲解流程（/camera/* 接口）：
-  1. /camera/upload        — 上传 JPEG 图片，触发视觉分析和文物检索并缓存结果
+  1. /camera/upload        — 上传 JPEG 图片，触发视觉分析和本地视觉匹配并缓存结果
   2. /camera/analyze_latest — 对最新上传图片进行分析并返回导游讲解
 
 UDP 协议：
@@ -43,8 +43,8 @@ from fastapi.responses import JSONResponse
 import core.config  # noqa: F401 - 加载项目 .env 环境变量
 from core.paths import (
     DEFAULT_CAMERA_TEST_IMAGE,
-    TMP_AUDIO_RECEIVED_WAV_DIR,
-    TMP_AUDIO_REPLY_WAV_DIR,
+    TMP_AUDIO_RECEIVED_DIR,
+    TMP_AUDIO_REPLIES_DIR,
     TMP_CAMERA_RECEIVED_DIR,
     ensure_runtime_dirs,
     env_path,
@@ -64,8 +64,9 @@ from services.ai_session_store import (
     is_session_canceled,
     mark_session_canceled,
 )
-from services.artifact_search_service import ArtifactMatchResult, ArtifactSearchService
-from services.photo_guide_service import PhotoGuideResult, PhotoGuideService, response_payload
+from services.visual_match_service import VisualMatchResult, VisualMatchService
+from services.exhibit_knowledge_service import ExhibitKnowledgeStore
+from services.guide_answer_service import GuideAnswerService, guide_response_payload
 from services.asr_service import transcribe_wav
 from services.voice_qa_service import FIXED_ANSWER, VoiceQaService
 from services.tts_service import ERROR_TEXT, synthesize_wav_16k
@@ -81,7 +82,7 @@ DEFAULT_BIND_HOST = "0.0.0.0"
 DEFAULT_UDP_PORT = 19000
 DEFAULT_HTTP_PORT = 18080
 # 默认保存目录
-DEFAULT_WAV_SAVE_DIR = TMP_AUDIO_RECEIVED_WAV_DIR
+DEFAULT_WAV_SAVE_DIR = TMP_AUDIO_RECEIVED_DIR
 DEFAULT_JPG_SAVE_DIR = TMP_CAMERA_RECEIVED_DIR
 # 默认分块大小（字节）
 DEFAULT_CHUNK_SIZE = 32768
@@ -153,22 +154,19 @@ def create_http_app(
     app.state.ai_reply_repeat = max(ai_reply_repeat, 1)
     app.state.ai_reply_extra_chunk = ai_reply_extra_chunk
     # 回复 WAV 保存目录
-    app.state.reply_save_dir = env_path("REPLY_WAV_SAVE_DIR", TMP_AUDIO_REPLY_WAV_DIR)
+    app.state.reply_save_dir = env_path("REPLY_WAV_SAVE_DIR", TMP_AUDIO_REPLIES_DIR)
     app.state.latest_reply_dir = env_path("LATEST_TMP_DIR", app.state.reply_save_dir)
 
-    # 初始化各服务实例
-    # 两个独立的百炼应用：
-    # - bailian_vision: 挂视觉指纹知识库，用于语义检索匹配文物
-    # - bailian_qa: 不挂知识库，用于通用导游问答
-    bailian_vision = BailianAppService(app_id=os.getenv("BAILIAN_VISION_APP_ID", ""))
-    bailian_qa = BailianAppService(app_id=os.getenv("BAILIAN_QA_APP_ID", ""))
+    # 初始化各服务实例。视觉匹配和文物知识都走本地文件；
+    # 百炼只负责把本地资料组织成适合语音播报的回答。
+    bailian_qa = BailianAppService()
 
     app.state.bailian_app_service = bailian_qa  # 向后兼容，默认指向问答应用
-    app.state.bailian_vision_service = bailian_vision
     app.state.bailian_qa_service = bailian_qa
     app.state.vision_service = VisionService()
-    app.state.artifact_search = ArtifactSearchService(bailian_vision)
-    app.state.photo_guide_service = PhotoGuideService(bailian_qa)
+    app.state.visual_match = VisualMatchService()
+    app.state.exhibit_knowledge = ExhibitKnowledgeStore()
+    app.state.guide_answer_service = GuideAnswerService(bailian_qa, app.state.exhibit_knowledge)
     app.state.voice_qa_service = VoiceQaService(bailian_qa)
     # 缓存最新视觉描述（替代旧版 latest_image_analysis）
     app.state.latest_visual_descriptions: dict[str, dict] = {}
@@ -183,9 +181,10 @@ def create_http_app(
         """Readiness probe with lightweight dependency configuration checks."""
         return {
             "ok": True,
-            "bailian_vision_configured": bool(app.state.bailian_vision_service.api_key and app.state.bailian_vision_service.app_id),
             "bailian_qa_configured": bool(app.state.bailian_qa_service.api_key and app.state.bailian_qa_service.app_id),
             "vision_provider": app.state.vision_service.provider,
+            "vision_profiles": len(app.state.visual_match.profiles),
+            "exhibit_cards": app.state.exhibit_knowledge.count(),
             "sessions": len(app.state.ai_sessions),
         }
 
@@ -413,7 +412,7 @@ def create_http_app(
                 if is_session_canceled(ai_session):
                     log(f"图片回答跳过 因会话已取消 session={ai_session.session_id}")
                     return "", ""
-            answer_text = await answer_latest_image_question(ai_session.device)
+            answer_text = await answer_latest_image_question(ai_session.device, asr_text)
             with app.state.ai_sessions_lock:
                 if is_session_canceled(ai_session):
                     log(f"图片回答结果因会话已取消而被忽略 session={ai_session.session_id}")
@@ -463,12 +462,12 @@ def create_http_app(
         @app.get("/debug/camera_guide/test")
         async def debug_camera_guide_test() -> JSONResponse:
             """端到端相机导游调试接口，生产环境默认关闭。"""
-            from tools.camera_guide_debug import run_camera_guide_test
+            from tools.check_camera_guide import run_camera_guide_check
 
-            result = await run_camera_guide_test(
+            result = await run_camera_guide_check(
                 vision_service=app.state.vision_service,
-                artifact_search=app.state.artifact_search,
-                photo_guide_service=app.state.photo_guide_service,
+                visual_match=app.state.visual_match,
+                guide_answer_service=app.state.guide_answer_service,
                 test_image_path=DEFAULT_CAMERA_TEST_IMAGE,
             )
             return JSONResponse(result, status_code=200 if result.get("ok") else 500)
@@ -482,11 +481,11 @@ def create_http_app(
         image_id: str,
         image_path: Path,
         *,
-        background_search: bool = True,
+        background_match: bool = True,
     ) -> VisualDescription:
-        """分析相机上传的图片，缓存视觉描述，并异步触发 KB 检索。
+        """分析相机上传的图片，缓存视觉描述，并异步触发本地视觉匹配。
 
-        视觉分析和 KB 检索都在上传阶段完成，
+        视觉分析和本地视觉匹配都在上传阶段完成，
         用户提问时直接使用缓存结果，只需等待问答生成（~8s）。
 
         Args:
@@ -515,7 +514,7 @@ def create_http_app(
             "time": datetime.now(),
             "status": status,
             "description": desc,
-            "match": None,  # 待 KB 检索填充
+            "match": None,  # 待本地视觉匹配填充
             "error": error,
         }
         app.state.latest_visual_descriptions[safe_device] = cache_entry
@@ -529,28 +528,28 @@ def create_http_app(
             f"cost={time.perf_counter() - vision_start:.3f}s"
         )
 
-        # 图片清晰且类别可辨时，立即做 KB 检索（用户拍照到提问间隙完成）
-        if status == "ready" and background_search:
-            asyncio.create_task(_background_search(safe_device, image_id, desc, cache_entry))
+        # 图片清晰且类别可辨时，立即做本地视觉匹配（用户拍照到提问间隙完成）
+        if status == "ready" and background_match:
+            asyncio.create_task(_background_match(safe_device, image_id, desc, cache_entry))
 
         return desc
 
-    async def _background_search(safe_device: str, image_id: str, desc: VisualDescription, cache_entry: dict) -> None:
-        """后台执行 KB 检索，结果写入缓存。
+    async def _background_match(safe_device: str, image_id: str, desc: VisualDescription, cache_entry: dict) -> None:
+        """后台执行本地视觉匹配，结果写入缓存。
 
         在上传阶段异步执行，不阻塞 HTTP 响应。
         用户提问时直接读取缓存中的 match 结果。
         """
-        search_start = time.perf_counter()
+        match_start = time.perf_counter()
         try:
-            match = await app.state.artifact_search.search_async(desc)
+            match = await app.state.visual_match.match_async(desc)
         except Exception as exc:
-            logger.exception("[CAMERA] 后台KB检索失败 device=%s image_id=%s", safe_device, image_id)
-            match = ArtifactMatchResult(evidence=f"检索异常: {exc}")
-        cost = time.perf_counter() - search_start
+            logger.exception("[CAMERA] 后台本地视觉匹配失败 device=%s image_id=%s", safe_device, image_id)
+            match = VisualMatchResult(evidence=f"匹配异常: {exc}")
+        cost = time.perf_counter() - match_start
         cache_entry["match"] = match
         log(
-            f"[CAMERA] 后台KB检索完成 device={safe_device} image_id={image_id} "
+            f"[CAMERA] 后台本地视觉匹配完成 device={safe_device} image_id={image_id} "
             f"match_id={match.match_id} match_name={match.match_name} "
             f"confidence={match.confidence:.2f} cost={cost:.3f}s"
         )
@@ -575,17 +574,20 @@ def create_http_app(
             "这个展品", "这件展品",
             "这个文物", "这件文物",
             "讲讲这个", "看看这个", "识别一下",
+            "它是什么", "它是", "它有什么",
+            "这个是", "这件是", "做什么用", "什么用途",
+            "哪个年代", "什么年代", "有什么故事", "介绍一下",
         )
         return any(keyword in normalized for keyword in keywords)
 
-    async def answer_latest_image_question(safe_device: str) -> str:
+    async def answer_latest_image_question(safe_device: str, user_question: str) -> str:
         """回答关于最新图片的问题。
 
-        KB 检索已在上传阶段后台完成，这里直接使用缓存结果，
-        用户只需等待问答生成（~8s），避免等待检索（+8s）。
+        本地视觉匹配已在上传阶段完成，这里直接使用缓存结果。
 
         Args:
             safe_device: 设备标识
+            user_question: 用户通过 ASR 得到的原始问题
 
         Returns:
             str: 导游讲解文本
@@ -601,18 +603,18 @@ def create_http_app(
         if not isinstance(desc, VisualDescription):
             return "这张照片信息不太够。请把展品放在画面中间，靠近一点，避开展柜反光后重拍。"
 
-        # 取缓存的 KB 检索结果；若后台检索尚未完成则同步执行
+        # 取缓存的本地匹配结果；若后台匹配尚未完成则同步执行
         match = cached.get("match")
-        if not isinstance(match, ArtifactMatchResult):
-            log(f"[CAMERA] 后台检索未完成，同步执行 device={safe_device} image_id={image_id}")
-            match = await app.state.artifact_search.search_async(desc)
+        if not isinstance(match, VisualMatchResult):
+            log(f"[CAMERA] 后台匹配未完成，同步执行 device={safe_device} image_id={image_id}")
+            match = await app.state.visual_match.match_async(desc)
         log(
-            f"[CAMERA] 使用缓存检索结果 device={safe_device} image_id={image_id} "
+            f"[CAMERA] 使用缓存匹配结果 device={safe_device} image_id={image_id} "
             f"match_id={match.match_id} match_name={match.match_name} confidence={match.confidence:.2f}"
         )
 
-        guide = await app.state.photo_guide_service.build_answer_async(
-            desc, match, device=safe_device, image_id=image_id,
+        guide = await app.state.guide_answer_service.build_answer_async(
+            desc, match, user_question=user_question, device=safe_device, image_id=image_id,
         )
         log(
             f"[CAMERA] 导游讲解 device={safe_device} image_id={image_id} "
@@ -971,8 +973,8 @@ def create_http_app(
         上传后同步完成：
         1. 图片验证和保存
         2. 视觉分析（VisionService）
-        3. 文物检索（ArtifactSearchService，本地优先，必要时百炼兜底）
-        4. 缓存视觉描述和检索结果，等待用户语音提问时再生成导游讲解
+        3. 文物匹配（VisualMatchService，本地视觉档案）
+        4. 缓存视觉描述和匹配结果，等待用户语音提问时再生成导游讲解
 
         参数：
         - device: 设备标识（默认 walkie-01）
@@ -1011,7 +1013,7 @@ def create_http_app(
         log(f"Camera 最新图片已更新 device={safe_device} image_id={image_id} file={save_path}")
 
         # 视觉分析。设备端不会轮询图片状态，因此这里在返回前给出最终分析结果。
-        desc = await analyze_camera_observation(safe_device, image_id, save_path, background_search=False)
+        desc = await analyze_camera_observation(safe_device, image_id, save_path, background_match=False)
         need_retake = not desc.is_clear or desc.category in ("无法判断", "未知")
         if need_retake:
             answer_text = "这张照片信息不太够。请把展品放在画面中间，靠近一点，避开展柜反光后重拍。"
@@ -1039,16 +1041,16 @@ def create_http_app(
             return JSONResponse(response_data)
 
         try:
-            search_start = time.perf_counter()
-            match = await app.state.artifact_search.search_async(desc)
+            match_start = time.perf_counter()
+            match = await app.state.visual_match.match_async(desc)
             log(
-                f"[CAMERA] KB检索(上传同步) image_id={image_id} "
+                f"[CAMERA] 本地视觉匹配(上传同步) image_id={image_id} "
                 f"match_id={match.match_id} confidence={match.confidence:.2f} "
-                f"cost={time.perf_counter() - search_start:.3f}s"
+                f"cost={time.perf_counter() - match_start:.3f}s"
             )
         except Exception as exc:
-            logger.exception("[CAMERA] KB检索失败 device=%s image_id=%s", safe_device, image_id)
-            match = ArtifactMatchResult(evidence=f"检索异常: {exc}")
+            logger.exception("[CAMERA] 本地视觉匹配失败 device=%s image_id=%s", safe_device, image_id)
+            match = VisualMatchResult(evidence=f"匹配异常: {exc}")
 
         cached = app.state.latest_visual_descriptions.get(safe_device)
         if isinstance(cached, dict) and cached.get("image_id") == image_id:
@@ -1078,6 +1080,7 @@ def create_http_app(
             "match_name": match.match_name,
             "evidence": match.evidence,
             "match_confidence": match.confidence,
+            "match_provider": getattr(match, "provider", ""),
             "search_provider": getattr(match, "provider", ""),
         }
         return JSONResponse(response_data)
@@ -1118,7 +1121,7 @@ def create_http_app(
 
         image_id = str(latest.get("image_id") or image_path.stem)
 
-        # 优先使用缓存的视觉描述 + KB检索结果
+        # 优先使用缓存的视觉描述 + 本地匹配结果
         cached = app.state.latest_visual_descriptions.get(safe_device)
         if (
             isinstance(cached, dict)
@@ -1126,32 +1129,32 @@ def create_http_app(
             and isinstance(cached.get("description"), VisualDescription)
         ):
             desc = cached["description"]
-            match = cached.get("match") if isinstance(cached.get("match"), ArtifactMatchResult) else None
+            match = cached.get("match") if isinstance(cached.get("match"), VisualMatchResult) else None
             log(f"[CAMERA] 使用缓存结果 image_id={image_id} has_match={match is not None}")
         else:
             desc = await analyze_camera_observation(safe_device, image_id, image_path)
             match = None
 
-        # KB 检索：优先用缓存，未完成则同步执行
+        # 本地视觉匹配：优先用缓存，未完成则同步执行
         if match is None:
-            search_start = time.perf_counter()
-            match = await app.state.artifact_search.search_async(desc)
+            match_start = time.perf_counter()
+            match = await app.state.visual_match.match_async(desc)
             log(
-                f"[CAMERA] KB检索(同步) image_id={image_id} "
+                f"[CAMERA] 本地视觉匹配(同步) image_id={image_id} "
                 f"match_id={match.match_id} confidence={match.confidence:.2f} "
-                f"cost={time.perf_counter() - search_start:.3f}s"
+                f"cost={time.perf_counter() - match_start:.3f}s"
             )
 
         guide_start = time.perf_counter()
-        guide = await app.state.photo_guide_service.build_answer_async(
-            desc, match, device=safe_device, image_id=image_id,
+        guide = await app.state.guide_answer_service.build_answer_async(
+            desc, match, user_question="这是什么", device=safe_device, image_id=image_id,
         )
         log(
             f"[CAMERA] 导游讲解 image_id={image_id} mode={guide.mode} grounded={int(guide.grounded)} "
             f"answer_chars={len(guide.answer_text)} cost={time.perf_counter() - guide_start:.3f}s"
         )
         return JSONResponse(
-            response_payload(
+            guide_response_payload(
                 device=safe_device,
                 image_id=image_id,
                 desc=desc,
@@ -1265,3 +1268,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+

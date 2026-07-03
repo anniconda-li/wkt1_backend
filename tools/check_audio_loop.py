@@ -1,4 +1,4 @@
-"""音频环回测试脚本。
+﻿"""音频环回测试脚本。
 
 验证完整的 TTS → ASR → LLM → TTS 链路：
 1. 将输入文本合成 TTS 音频（或使用已有 WAV）
@@ -18,7 +18,7 @@ import wave
 from pathlib import Path
 
 # 将项目根目录加入 Python 路径
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -171,3 +171,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

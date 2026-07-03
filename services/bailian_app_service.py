@@ -51,12 +51,13 @@ class BailianAppService:
 
         Args:
             api_key: DashScope API Key，默认从环境变量 BAILIAN_API_KEY 读取
-            app_id: 百炼应用 ID，默认从环境变量 BAILIAN_APP_ID 读取
+            app_id: 百炼应用 ID，默认从环境变量 BAILIAN_QA_APP_ID 读取，兼容 BAILIAN_APP_ID
             base_url: API 基础地址，默认从环境变量 BAILIAN_APP_BASE_URL 读取
             timeout: 请求超时，默认从环境变量 BAILIAN_TIMEOUT 读取（30秒）
         """
         self.api_key = (api_key if api_key is not None else os.getenv("BAILIAN_API_KEY", "")).strip()
-        self.app_id = (app_id if app_id is not None else os.getenv("BAILIAN_APP_ID", "")).strip()
+        default_app_id = os.getenv("BAILIAN_QA_APP_ID", "") or os.getenv("BAILIAN_APP_ID", "")
+        self.app_id = (app_id if app_id is not None else default_app_id).strip()
         self.base_url = (
             base_url if base_url is not None else os.getenv("BAILIAN_APP_BASE_URL", DEFAULT_BASE_URL)
         ).rstrip("/")
@@ -123,7 +124,7 @@ class BailianAppService:
 
         # 校验 App ID
         if not self.app_id:
-            logger.error("[BAILIAN] BAILIAN_APP_ID 未配置")
+            logger.error("[BAILIAN] BAILIAN_QA_APP_ID 未配置")
             failed_after = time.perf_counter() - total_start
             _log_bailian_result(failed_after, "", "missing_app_id", failed_after)
             print(f"[BAILIAN-TIME] failed_after={failed_after:.3f}s error=缺失 App ID", flush=True)

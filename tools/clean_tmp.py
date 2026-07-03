@@ -1,13 +1,13 @@
 """临时文件清理工具。
 
-清理项目 tmp/ 目录下的各类临时文件：
+清理项目 tmp/ 目录下的运行产物：
 - 相机预处理图片
-- 测试中间文件
-- 音频调试文件
-- 旧版临时目录
+- 音频上传和回复文件
+- 调试输出文件
 
 清理后自动重新创建运行时需要的目录结构。
 包含安全保护：只清理 tmp/ 目录下的内容，不会误删其他位置。
+默认保留 tmp/camera/received/，便于保留设备现场拍摄原图。
 """
 
 from __future__ import annotations
@@ -22,25 +22,22 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.paths import (
-    DEFAULT_CAMERA_TEST_IMAGE,
     RUNTIME_DIRS,
+    TMP_AUDIO_RECEIVED_DIR,
+    TMP_AUDIO_REPLIES_DIR,
     TMP_CAMERA_PREPROCESS_DIR,
     TMP_DEBUG_DIR,
     TMP_DIR,
+    camera_test_image_info,
     ensure_project_dirs,
 )
 
 # 需要清理的目录和文件列表
 CLEAN_PATHS = (
     TMP_CAMERA_PREPROCESS_DIR,
-    TMP_DIR / "camera" / "latest",
-    TMP_DIR / "camera" / "test",
-    TMP_DIR / "audio" / "debug_reply_wav",
-    TMP_DIR / "audio" / "received_wav",
-    TMP_DIR / "audio" / "reply_wav",
-    TMP_DIR / "runs",
-    TMP_DEBUG_DIR / "test_ai_cancel",
-    TMP_DIR / "test_ai_cancel",
+    TMP_AUDIO_RECEIVED_DIR,
+    TMP_AUDIO_REPLIES_DIR,
+    TMP_DEBUG_DIR,
 )
 
 
@@ -95,9 +92,9 @@ def main() -> int:
     # 输出清理结果
     print("[OK] tmp/ 项目目录已确保")
     print(f"[OK] runtime_dirs={len(RUNTIME_DIRS)}")
-    print(f"[OK] default_test_image={DEFAULT_CAMERA_TEST_IMAGE}")
+    print(f"[OK] default_test_image={camera_test_image_info()}")
     print(f"[OK] removed={removed if removed else 'none'}")
-    print("[INFO] 固定的相机测试图片位于 tests/data/camera")
+    print("[INFO] 已保留 tmp/camera/received/ 中的设备原图")
     return 0
 
 

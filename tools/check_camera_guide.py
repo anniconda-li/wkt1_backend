@@ -1,26 +1,34 @@
-"""相机导游调试模块。
+﻿"""相机导游调试模块。
 
-提供端到端的相机导游测试功能（新架构）：
+提供端到端的相机导游测试功能：
 1. 调用视觉服务分析图片 → VisualDescription
-2. 调用文物检索服务在知识库中匹配 → ArtifactMatchResult
-3. 调用拍照导游服务生成讲解 → PhotoGuideResult
+2. 调用本地视觉档案匹配 → VisualMatchResult
+3. 调用拍照导游服务生成讲解 → GuideAnswerResult
 
-新架构流程：拍照 → 视觉描述 → KB检索 → 匹配文物 → 问答生成讲解
+流程：拍照 → 视觉描述 → 本地匹配 → 读取本地卡片 → 问答组织讲解
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import logging
+import sys
 import time
 from pathlib import Path
 from typing import Any
 
-from core.paths import DEFAULT_CAMERA_TEST_IMAGE
-from services.artifact_search_service import ArtifactMatchResult, ArtifactSearchService
-from services.bailian_app_service import FALLBACK_TEXT, BailianAppService
-from services.photo_guide_service import PhotoGuideResult, PhotoGuideService
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import core.config  # noqa: E402,F401 - 加载项目 .env 环境变量
+from core.paths import DEFAULT_CAMERA_TEST_IMAGE, ensure_project_dirs
+from services.bailian_app_service import BailianAppService
+from services.exhibit_knowledge_service import ExhibitKnowledgeStore
+from services.visual_match_service import VisualMatchService
+from services.guide_answer_service import GuideAnswerService
 from services.vision_service import VisionService
 
 # 默认测试提问文本
@@ -28,11 +36,11 @@ DEFAULT_CAMERA_GUIDE_TEST_TEXT = "这是什么"
 logger = logging.getLogger(__name__)
 
 
-async def run_camera_guide_test(
+async def run_camera_guide_check(
     *,
     vision_service: VisionService,
-    artifact_search: ArtifactSearchService,
-    photo_guide_service: PhotoGuideService,
+    visual_match: VisualMatchService,
+    guide_answer_service: GuideAnswerService,
     test_image_path: Path = DEFAULT_CAMERA_TEST_IMAGE,
     user_text: str = DEFAULT_CAMERA_GUIDE_TEST_TEXT,
 ) -> dict[str, Any]:
@@ -41,14 +49,14 @@ async def run_camera_guide_test(
     流程：
     1. 检查测试图片是否存在
     2. 视觉分析 → VisualDescription
-    3. 知识库检索 → ArtifactMatchResult
-    4. 导游讲解 → PhotoGuideResult
+    3. 本地视觉匹配 → VisualMatchResult
+    4. 导游讲解 → GuideAnswerResult
     5. 返回包含所有中间结果和耗时统计的字典
 
     Args:
         vision_service: 视觉服务实例
-        artifact_search: 文物检索服务实例
-        photo_guide_service: 拍照导游服务实例
+        visual_match: 本地视觉匹配服务实例
+        guide_answer_service: 导游讲解组织服务实例
         test_image_path: 测试图片路径
         user_text: 模拟用户提问
 
@@ -82,10 +90,10 @@ async def run_camera_guide_test(
         )
     vision_elapsed_ms = _elapsed_ms(vision_start)
 
-    # 第 2 步：知识库检索
-    search_start = time.perf_counter()
+    # 第 2 步：本地视觉匹配
+    match_start = time.perf_counter()
     try:
-        match = await artifact_search.search_async(desc)
+        match = await visual_match.match_async(desc)
     except Exception as exc:
         return _failure(
             stage="search",
@@ -95,13 +103,13 @@ async def run_camera_guide_test(
             total_start=total_start,
             extra={"vision_elapsed_ms": vision_elapsed_ms, "desc": desc.to_dict()},
         )
-    search_elapsed_ms = _elapsed_ms(search_start)
+    match_elapsed_ms = _elapsed_ms(match_start)
 
     # 第 3 步：生成导游讲解
     guide_start = time.perf_counter()
     try:
-        guide = await photo_guide_service.build_answer_async(
-            desc, match, device="debug", image_id=test_image_path.stem,
+        guide = await guide_answer_service.build_answer_async(
+            desc, match, user_question=user_text, device="debug", image_id=test_image_path.stem,
         )
     except Exception as exc:
         return _failure(
@@ -129,7 +137,7 @@ async def run_camera_guide_test(
         },
         "timing": {
             "vision_elapsed_ms": vision_elapsed_ms,
-            "search_elapsed_ms": search_elapsed_ms,
+            "match_elapsed_ms": match_elapsed_ms,
             "guide_elapsed_ms": guide_elapsed_ms,
             "total_elapsed_ms": total_elapsed_ms,
         },
@@ -164,10 +172,43 @@ def _failure(
 def _log_debug(payload: dict[str, Any]) -> None:
     """输出相机导游调试日志（JSON 格式）。"""
     text = json.dumps(payload, ensure_ascii=False)
-    logger.info("[CAMERA-GUIDE-DEBUG] %s", text)
-    print(f"[CAMERA-GUIDE-DEBUG] {text}", flush=True)
+    logger.info("[CAMERA-GUIDE-CHECK] %s", text)
+    print(f"[CAMERA-GUIDE-CHECK] {text}", flush=True)
 
 
 def _elapsed_ms(start: float) -> int:
     """计算从 start 到现在的毫秒数。"""
     return int((time.perf_counter() - start) * 1000)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="运行一次相机导游链路检查")
+    parser.add_argument(
+        "--image",
+        default=str(DEFAULT_CAMERA_TEST_IMAGE),
+        help=f"测试图片路径，默认使用 {DEFAULT_CAMERA_TEST_IMAGE}",
+    )
+    parser.add_argument("--text", default=DEFAULT_CAMERA_GUIDE_TEST_TEXT, help="模拟用户提问")
+    parser.add_argument("--mock-vision", action="store_true", help="使用 mock 视觉描述，不调用视觉模型")
+    parser.add_argument("--no-bailian", action="store_true", help="跳过百炼组织回答，使用本地降级讲解")
+    args = parser.parse_args()
+
+    ensure_project_dirs()
+    bailian = None if args.no_bailian else BailianAppService()
+    result = asyncio.run(
+        run_camera_guide_check(
+            vision_service=VisionService(provider="mock" if args.mock_vision else None),
+            visual_match=VisualMatchService(),
+            guide_answer_service=GuideAnswerService(bailian, ExhibitKnowledgeStore()),
+            test_image_path=Path(args.image),
+            user_text=args.text,
+        )
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("ok") else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+

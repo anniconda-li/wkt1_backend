@@ -14,7 +14,7 @@
     "is_key_exhibit": true,
     "priority": 100,
     "reference_images": [
-      "knowledge/refs/yingguo_yuying/ref_1.jpg"
+      "photo/baiyuxiandiaoying.jpeg"
     ],
     "basic_info": {
       "dynasty": "西周晚期",
@@ -94,7 +94,7 @@
     "is_key_exhibit": true,
     "priority": 90,
     "reference_images": [
-      "knowledge/refs/panlongniu_daigai_tonghe/ref_1.jpg"
+      "photo/panlongniudaigaitonghe.jpeg"
     ],
     "basic_info": {
       "dynasty": "西周",
@@ -162,6 +162,12 @@
       "青铜簋",
       "盛食器",
       "鼎形",
+      "青铜鼎",
+      "三足器",
+      "圆形敞口",
+      "敞口",
+      "双耳上翘",
+      "兽面蹄足",
       "垂鳞纹",
       "束腰",
       "簋形",
@@ -195,7 +201,7 @@
     "is_key_exhibit": true,
     "priority": 80,
     "reference_images": [
-      "knowledge/refs/denggong_gui/ref_1.jpg"
+      "photo/denggonggui.jpeg"
     ],
     "basic_info": {
       "dynasty": "西周",
@@ -255,6 +261,12 @@
       "鋬",
       "带盖铜盉",
       "鼎形",
+      "青铜鼎",
+      "三足器",
+      "圆形敞口",
+      "敞口",
+      "双耳上翘",
+      "兽面蹄足",
       "三足鼎立",
       "垂鳞纹",
       "束腰",
@@ -286,7 +298,7 @@
     "is_key_exhibit": true,
     "priority": 70,
     "reference_images": [
-      "knowledge/refs/lushan_huaci_sanzuxi/ref_1.jpg"
+      "photo/yaoheiyoulanbanhuakousanzuxi.jpeg"
     ],
     "basic_info": {
       "dynasty": "唐代",
@@ -361,7 +373,7 @@
     "is_key_exhibit": true,
     "priority": 70,
     "reference_images": [
-      "knowledge/refs/shuyao_chuilinwen_shengding/ref_1.jpg"
+      "photo/shuyaochuilinwenshengding.jpeg"
     ],
     "basic_info": {
       "dynasty": "春秋",
@@ -402,7 +414,15 @@
       "铜绿",
       "锈迹斑驳",
       "兽面蹄形足",
-      "粗壮三足"
+      "粗壮三足",
+      "三足圆腹",
+      "双耳上翘",
+      "兽面蹄足",
+      "中部凸起环带",
+      "圆形敞口",
+      "敞口",
+      "浮雕纹饰",
+      "三足器"
     ],
     "negative_terms": [
       "带盖",

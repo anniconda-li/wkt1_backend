@@ -1,4 +1,4 @@
-"""HTTP 客户端端到端测试脚本。
+﻿"""HTTP 客户端端到端测试脚本。
 
 这个脚本不启动后端服务，只模拟 ESP32 客户端向已经运行的后端发送
 图片和音频：
@@ -11,8 +11,8 @@
 7. POST /ai/result_chunk 下载回复 WAV
 
 用法示例：
-    python tests/scripts/http_client_e2e.py --base-url http://127.0.0.1:18080 \
-        --image tests/data/camera/yingguo_yvying.jpg \
+    python tools/check_http_client_e2e.py --base-url http://127.0.0.1:18080 \
+        --image tests/data/camera/yingguo_yuying.jpg \
         --wav tests/data/audio/what.wav
 """
 
@@ -29,8 +29,8 @@ from typing import Any, Iterator
 
 import requests
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_IMAGE = PROJECT_ROOT / "tests" / "data" / "camera" / "yingguo_yvying.jpg"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_IMAGE = PROJECT_ROOT / "tests" / "data" / "camera" / "yingguo_yuying.jpg"
 DEFAULT_WAV = PROJECT_ROOT / "tests" / "data" / "audio" / "what.wav"
 DEFAULT_OUT_DIR = PROJECT_ROOT / "tmp" / "debug" / "http_client_e2e"
 DEFAULT_CHUNK_SIZE = 32768
@@ -121,7 +121,7 @@ def upload_camera(base_url: str, image_path: Path, *, device: str, timeout: floa
         "[CAMERA] "
         f"ok={data.get('ok')} analysis_ok={data.get('analysis_ok')} "
         f"mode={data.get('mode')} image_id={data.get('image_id')} "
-        f"best={data.get('best_candidate_name')}"
+        f"match={data.get('match_name')}"
     )
     return data
 
@@ -358,3 +358,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+

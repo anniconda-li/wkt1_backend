@@ -1,17 +1,17 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """文物识别管线测试脚本。
 
-端到端测试：图片 → 视觉描述 → 知识库检索 → 文物匹配 → 导游讲解。
+端到端测试：图片 → 视觉描述 → 本地视觉匹配 → 文物卡片 → 导游讲解。
 
 用法:
     # 只用图片测试
-    python tools/test_artifact_pipeline.py --image photo/test_exhibit.jpg
+    python tools/check_artifact_pipeline.py --image photo/test_exhibit.jpg
 
     # 指定图片和问题
-    python tools/test_artifact_pipeline.py --image photo/test_exhibit.jpg --question "这是什么"
+    python tools/check_artifact_pipeline.py --image photo/test_exhibit.jpg --question "这是什么"
 
-    # 使用 mock 模式（不调用 API）
-    python tools/test_artifact_pipeline.py --image photo/ying.jpg --mock
+    # 使用 mock 视觉模式
+    python tools/check_artifact_pipeline.py --image photo/ying.jpg --mock --no-bailian
 
 要求:
     pip install dashscope httpx pillow
@@ -36,9 +36,10 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import core.config  # noqa: F401 - 加载 .env
 from core.paths import DEFAULT_CAMERA_TEST_IMAGE, TMP_DEBUG_DIR, ensure_runtime_dirs
-from services.artifact_search_service import ArtifactSearchService
+from services.visual_match_service import VisualMatchService
 from services.bailian_app_service import BailianAppService
-from services.photo_guide_service import PhotoGuideService
+from services.exhibit_knowledge_service import ExhibitKnowledgeStore
+from services.guide_answer_service import GuideAnswerService
 from services.tts_service import synthesize_wav_16k
 from services.vision_service import VisionService
 
@@ -113,19 +114,21 @@ async def run_test(
     image_path: str,
     user_question: str = "这是什么",
     use_mock: bool = False,
+    use_bailian: bool = True,
     output_dir: str = str(DEFAULT_OUTPUT_DIR),
 ) -> dict:
     """运行一次完整的文物识别管线测试。
 
     流程：
     1. VisionService → VisualDescription
-    2. ArtifactSearchService → ArtifactMatchResult
-    3. PhotoGuideService → PhotoGuideResult
+    2. VisualMatchService → VisualMatchResult
+    3. GuideAnswerService → GuideAnswerResult
 
     Args:
         image_path: 测试图片路径
         user_question: 用户问题
-        use_mock: 是否使用 mock 模式
+        use_mock: 是否使用 mock 视觉模式
+        use_bailian: 是否调用百炼组织讲解
         output_dir: TTS 回复 WAV 输出目录
 
     Returns:
@@ -145,9 +148,7 @@ async def run_test(
     print_result("输出目录", str(output_path_dir))
     print_result("视觉模式", "mock" if use_mock else os.getenv("VISION_PROVIDER", "dashscope"))
     print_result("TTS模式", os.getenv("TTS_PROVIDER", "mock"))
-    vision_app_id = os.getenv("BAILIAN_VISION_APP_ID", "未配置")
-    qa_app_id = os.getenv("BAILIAN_QA_APP_ID", "未配置")
-    print_result("视觉检索应用ID", vision_app_id[:8] + "***" if len(vision_app_id) > 8 else vision_app_id)
+    qa_app_id = os.getenv("BAILIAN_QA_APP_ID") or os.getenv("BAILIAN_APP_ID", "未配置")
     print_result("问答应用ID", qa_app_id[:8] + "***" if len(qa_app_id) > 8 else qa_app_id)
 
     # 初始化服务
@@ -156,10 +157,10 @@ async def run_test(
     else:
         vision_service = VisionService()
 
-    bailian_vision = BailianAppService(app_id=os.getenv("BAILIAN_VISION_APP_ID", ""))
-    bailian_qa = BailianAppService(app_id=os.getenv("BAILIAN_QA_APP_ID", ""))
-    artifact_search = ArtifactSearchService(bailian_vision)
-    photo_guide = PhotoGuideService(bailian_qa)
+    bailian_qa = BailianAppService() if use_bailian else None
+    visual_match = VisualMatchService()
+    knowledge_store = ExhibitKnowledgeStore()
+    guide_answer = GuideAnswerService(bailian_qa, knowledge_store)
 
     total_start = time.perf_counter()
 
@@ -185,15 +186,15 @@ async def run_test(
         print_result("风险提示", desc.risk)
     print_result("耗时", f"{vision_cost:.3f}s")
 
-    # ---- 第 2 步：知识库检索 ----
-    print_separator("第 2 步：知识库检索")
-    search_start = time.perf_counter()
+    # ---- 第 2 步：本地视觉匹配 ----
+    print_separator("第 2 步：本地视觉匹配")
+    match_start = time.perf_counter()
     try:
-        match = await artifact_search.search_async(desc)
+        match = await visual_match.match_async(desc)
     except Exception as exc:
-        print(f"[FAIL] 知识库检索异常: {exc}")
+        print(f"[FAIL] 本地视觉匹配异常: {exc}")
         return {"ok": False, "stage": "search", "error": str(exc), "visual_description": desc.to_dict()}
-    search_cost = time.perf_counter() - search_start
+    match_cost = time.perf_counter() - match_start
 
     print_result("匹配ID", match.match_id)
     print_result("匹配名称", match.match_name)
@@ -204,14 +205,14 @@ async def run_test(
         print_result("匹配状态", status)
     else:
         print_result("匹配状态", "[INFO] 无匹配")
-    print_result("耗时", f"{search_cost:.3f}s")
+    print_result("耗时", f"{match_cost:.3f}s")
 
     # ---- 第 3 步：导游讲解 ----
     print_separator("第 3 步：导游讲解")
     guide_start = time.perf_counter()
     try:
-        guide = await photo_guide.build_answer_async(
-            desc, match, device="test", image_id=image_path.stem,
+        guide = await guide_answer.build_answer_async(
+            desc, match, user_question=user_question, device="test", image_id=image_path.stem,
         )
     except Exception as exc:
         print(f"[FAIL] 导游讲解异常: {exc}")
@@ -269,7 +270,7 @@ async def run_test(
     print_separator("总耗时")
     print(
         f"  {total_cost:.3f}s "
-        f"(视觉={vision_cost:.3f}s 检索={search_cost:.3f}s 讲解={guide_cost:.3f}s TTS={tts_cost:.3f}s)"
+        f"(视觉={vision_cost:.3f}s 匹配={match_cost:.3f}s 讲解={guide_cost:.3f}s TTS={tts_cost:.3f}s)"
     )
 
     return {
@@ -289,7 +290,7 @@ async def run_test(
         },
         "timing": {
             "vision_elapsed_s": round(vision_cost, 3),
-            "search_elapsed_s": round(search_cost, 3),
+            "match_elapsed_s": round(match_cost, 3),
             "guide_elapsed_s": round(guide_cost, 3),
             "tts_elapsed_s": round(tts_cost, 3),
             "total_elapsed_s": round(total_cost, 3),
@@ -299,15 +300,15 @@ async def run_test(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="文物识别管线测试：图片 → 视觉描述 → KB检索 → 导游讲解",
+        description="文物识别管线测试：图片 → 视觉描述 → 本地视觉匹配 → 导游讲解",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  python tools/test_artifact_pipeline.py --image photo/test.jpg
-  python tools/test_artifact_pipeline.py --image photo/test.jpg --question "这是什么文物"
-  python tools/test_artifact_pipeline.py --image photo/test.jpg --mock
-  python tools/test_artifact_pipeline.py --image photo/test.jpg --out-dir tmp/debug/artifact_pipeline
-  python tools/test_artifact_pipeline.py --image photo/test.jpg --json
+  python tools/check_artifact_pipeline.py --image photo/test.jpg
+  python tools/check_artifact_pipeline.py --image photo/test.jpg --question "这是什么文物"
+  python tools/check_artifact_pipeline.py --image photo/test.jpg --mock --no-bailian
+  python tools/check_artifact_pipeline.py --image photo/test.jpg --out-dir tmp/debug/artifact_pipeline
+  python tools/check_artifact_pipeline.py --image photo/test.jpg --json
         """,
     )
     parser.add_argument(
@@ -325,7 +326,12 @@ def main() -> None:
     parser.add_argument(
         "--mock", "-m",
         action="store_true",
-        help="使用 mock 模式，不调用真实 API",
+        help="使用 mock 视觉描述，不调用视觉模型",
+    )
+    parser.add_argument(
+        "--no-bailian",
+        action="store_true",
+        help="跳过百炼组织回答，使用本地降级讲解",
     )
     parser.add_argument(
         "--out-dir",
@@ -344,6 +350,7 @@ def main() -> None:
         image_path=args.image,
         user_question=args.question,
         use_mock=args.mock,
+        use_bailian=not args.no_bailian,
         output_dir=args.out_dir,
     ))
 
@@ -363,3 +370,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+

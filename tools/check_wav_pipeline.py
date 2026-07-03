@@ -1,10 +1,10 @@
-"""WAV 流水线调试脚本。
+﻿"""WAV 流水线调试脚本。
 
 从本地 WAV 文件运行 ASR → LLM → TTS 完整链路调试。
 每一步都有独立的耗时统计和错误处理。
 
 用法：
-    python tests/scripts/wav_pipeline.py --wav path/to/audio.wav --device debug-server
+    python tools/check_wav_pipeline.py --wav path/to/audio.wav --device debug-server
 """
 
 from __future__ import annotations
@@ -16,7 +16,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import core.config  # noqa: F401 - 加载项目 .env 环境变量
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import core.config  # noqa: E402,F401 - 加载项目 .env 环境变量
 from core.paths import TEST_AUDIO_DIR, TMP_DEBUG_AUDIO_DIR
 from services.asr_service import transcribe_wav
 from services.bailian_app_service import BailianAppService, FALLBACK_TEXT
@@ -119,3 +123,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+

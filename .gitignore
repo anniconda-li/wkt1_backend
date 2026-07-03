@@ -21,7 +21,6 @@ ENV/
 
 # Runtime outputs
 tmp/
-photo/
 logs/
 *.log
 *.pid
@@ -45,6 +44,10 @@ pip-wheel-metadata/
 PROJECT_REVIEW.md
 
 # Keep curated test data
+!photo/
+!photo/*.jpg
+!photo/*.jpeg
+!photo/*.png
 !tests/
 !tests/data/
 !tests/data/received_wav/

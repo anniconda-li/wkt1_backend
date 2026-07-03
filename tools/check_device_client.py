@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """WTK1 设备客户端测试脚本。
 
 模拟 ESP32 设备端完整业务流程，测试后端所有 HTTP 接口。
@@ -13,22 +13,22 @@
 
 用法：
     # 自动启动服务器 + 运行全部测试（推荐）
-    python tests/scripts/device_client_test.py --base-url http://127.0.0.1:18080 --server
+    python tools/check_device_client.py --base-url http://127.0.0.1:18080 --server
 
     # 仅启动服务器，不运行测试（手动调试）
-    python tests/scripts/device_client_test.py --base-url http://127.0.0.1:18080 --server-only
+    python tools/check_device_client.py --base-url http://127.0.0.1:18080 --server-only
 
     # 连接已有服务器运行测试
-    python tests/scripts/device_client_test.py --base-url http://127.0.0.1:18080
+    python tools/check_device_client.py --base-url http://127.0.0.1:18080
 
     # 仅语音测试
-    python tests/scripts/device_client_test.py --base-url http://127.0.0.1:18080 --skip-camera
+    python tools/check_device_client.py --base-url http://127.0.0.1:18080 --skip-camera
 
     # 交互式选择测试场景
-    python tests/scripts/device_client_test.py --base-url http://127.0.0.1:18080 --interactive
+    python tools/check_device_client.py --base-url http://127.0.0.1:18080 --interactive
 
     # 压力测试（多次语音问答）
-    python tests/scripts/device_client_test.py --base-url http://127.0.0.1:18080 --stress 5
+    python tools/check_device_client.py --base-url http://127.0.0.1:18080 --stress 5
 """
 
 from __future__ import annotations
@@ -49,8 +49,8 @@ from typing import Any
 
 import requests
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_IMAGE = PROJECT_ROOT / "tests" / "data" / "camera" / "yingguo_yvying.jpg"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_IMAGE = PROJECT_ROOT / "tests" / "data" / "camera" / "yingguo_yuying.jpg"
 DEFAULT_WAV = PROJECT_ROOT / "tests" / "data" / "audio" / "what.wav"
 DEFAULT_OUT_DIR = PROJECT_ROOT / "tmp" / "debug" / "device_client"
 DEFAULT_CHUNK_SIZE = 32768
@@ -298,7 +298,13 @@ def scenario_health_check(base_url: str, timeout: float, verbose: bool) -> Scena
         if not ready.get("ok"):
             return ScenarioResult("健康检查-readyz", TestResult.FAIL, time.perf_counter() - start, "readyz 返回 ok=false")
 
-        detail = f"vision_cfg={ready.get('bailian_vision_configured')} qa_cfg={ready.get('bailian_qa_configured')} vision={ready.get('vision_provider')} sessions={ready.get('sessions')}"
+        detail = (
+            f"qa_cfg={ready.get('bailian_qa_configured')} "
+            f"vision={ready.get('vision_provider')} "
+            f"profiles={ready.get('vision_profiles')} "
+            f"cards={ready.get('exhibit_cards')} "
+            f"sessions={ready.get('sessions')}"
+        )
         return ScenarioResult("健康检查", TestResult.PASS, time.perf_counter() - start, detail, {"health": health, "ready": ready})
     except Exception as e:
         return ScenarioResult("健康检查", TestResult.FAIL, time.perf_counter() - start, str(e))
@@ -841,3 +847,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+

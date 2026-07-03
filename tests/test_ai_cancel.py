@@ -1,4 +1,4 @@
-"""AI 会话取消功能单元测试。
+﻿"""AI 会话取消功能单元测试。
 
 测试 /ai/cancel 接口的各种场景：
 - 立即取消应在 result_info 中反映
@@ -22,7 +22,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 # 将项目根目录加入 Python 路径
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from server.walkie_app import create_http_app
 
@@ -162,3 +162,4 @@ class AiCancelTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
