@@ -79,10 +79,21 @@ class GuideAnswerService:
             return GuideAnswerResult(mode, False, RETAKE_ANSWER, gate_reason, match.match_id, match.match_name)
         if mode == SPECIFIC_MODE:
             card = self.knowledge_store.get(match.match_id)
+            if card and _is_identity_question(user_question):
+                return GuideAnswerResult(
+                    mode,
+                    True,
+                    _identity_answer(card),
+                    f"{gate_reason}；本地快速识别回答",
+                    match.match_id,
+                    match.match_name,
+                )
             answer = self._ask_specific(desc, match, card, user_question=user_question, device=device, image_id=image_id)
             if _is_valid(answer):
                 return GuideAnswerResult(mode, card is not None, _clean(answer), gate_reason, match.match_id, match.match_name)
             return self._fallback_specific(match, card, gate_reason)
+        if _is_identity_question(user_question):
+            return _fallback_category(desc, f"{gate_reason}；本地类别快速回答")
         return self._build_category_answer(desc, gate_reason, user_question=user_question)
 
     async def build_answer_async(
@@ -101,10 +112,21 @@ class GuideAnswerService:
             return GuideAnswerResult(mode, False, RETAKE_ANSWER, gate_reason, match.match_id, match.match_name)
         if mode == SPECIFIC_MODE:
             card = self.knowledge_store.get(match.match_id)
+            if card and _is_identity_question(user_question):
+                return GuideAnswerResult(
+                    mode,
+                    True,
+                    _identity_answer(card),
+                    f"{gate_reason}；本地快速识别回答",
+                    match.match_id,
+                    match.match_name,
+                )
             answer = await self._ask_specific_async(desc, match, card, user_question=user_question, device=device, image_id=image_id)
             if _is_valid(answer):
                 return GuideAnswerResult(mode, card is not None, _clean(answer), gate_reason, match.match_id, match.match_name)
             return self._fallback_specific(match, card, gate_reason)
+        if _is_identity_question(user_question):
+            return _fallback_category(desc, f"{gate_reason}；本地类别快速回答")
         return await self._build_category_answer_async(desc, gate_reason, user_question=user_question)
 
     def _ask_specific(
@@ -279,11 +301,39 @@ def _clean(answer: str) -> str:
 
 def _answer_style(question: str) -> str:
     question = question or ""
-    if any(token in question for token in ("这是什么", "叫什么", "它是什么", "这个是", "这件是")):
+    if _is_identity_question(question):
         return "简单识别问题，1到2句话，通常不需要追问引导"
     if any(token in question for token in ("故事", "历史", "讲讲", "介绍", "详细", "为什么重要", "特别")):
         return "展开型问题，可讲背景、重要性和看点，可自然给一个相关追问"
     return "单点问题，2到4句话，直接回答，可不引导"
+
+
+def _is_identity_question(question: str) -> bool:
+    question = question or ""
+    return any(token in question for token in ("这是什么", "叫什么", "它是什么", "这个是", "这件是"))
+
+
+def _identity_answer(card: ExhibitCard) -> str:
+    dynasty = (
+        card.basic_info.get("时代")
+        or card.basic_info.get("dynasty")
+        or card.basic_info.get("年代")
+        or ""
+    )
+    usage = (
+        card.basic_info.get("性质用途")
+        or card.basic_info.get("usage")
+        or ""
+    )
+    parts = [f"这是{card.name}"]
+    if dynasty:
+        parts.append(str(dynasty))
+    if card.category:
+        parts.append(card.category)
+    answer = "，".join(parts)
+    if usage:
+        answer += f"，主要可理解为{usage}"
+    return f"{answer}。"
 
 
 def _short_text(text: str, limit: int) -> str:
