@@ -111,6 +111,11 @@ class RecordingGuideAnswerService:
         )
 
 
+class FailingVoiceQaService:
+    async def _ask_llm_async(self, *args, **kwargs) -> str:
+        raise AssertionError("contextual image follow-up should not call generic voice QA")
+
+
 class CameraUploadContextTest(unittest.TestCase):
     def setUp(self) -> None:
         os.environ["CAMERA_UPLOAD_TIMEOUT"] = "5"
@@ -227,6 +232,7 @@ class CameraUploadContextTest(unittest.TestCase):
         async def scenario() -> None:
             guide = RecordingGuideAnswerService()
             self.app.state.guide_answer_service = guide
+            self.app.state.voice_qa_service = FailingVoiceQaService()
             walkie_app.transcribe_wav = lambda _path: "为什么"
 
             async with await self._client() as client:
@@ -256,6 +262,44 @@ class CameraUploadContextTest(unittest.TestCase):
                 self.assertIn("承接上一轮回答", followup_call["user_question"])
                 self.assertIn("上一轮回答摘要", followup_call["conversation_context"])
                 self.assertNotEqual(followup_call["user_question"], "为什么")
+
+        asyncio.run(scenario())
+
+    def test_pronoun_story_followup_uses_previous_image_answer_context(self) -> None:
+        async def scenario() -> None:
+            guide = RecordingGuideAnswerService()
+            self.app.state.guide_answer_service = guide
+            self.app.state.voice_qa_service = FailingVoiceQaService()
+            walkie_app.transcribe_wav = lambda _path: "他有什么著名故事？"
+
+            async with await self._client() as client:
+                self.vision.release_first.set()
+                upload = await client.post(
+                    "/camera/upload?device=test-camera",
+                    content=self.jpeg,
+                    headers={"Content-Type": "image/jpeg"},
+                )
+                self.assertEqual(upload.status_code, 200)
+
+                first_answer = await client.post("/camera/analyze_latest?device=test-camera")
+                self.assertEqual(first_answer.status_code, 200)
+                self.assertEqual(guide.calls[-1]["user_question"], "这是什么")
+
+                start = await client.post("/ai/start", json={"device": "test-camera"})
+                session = start.json()["session"]
+                uploaded = await client.post(
+                    f"/ai/upload?session={session}&index=0&offset=0&total={len(self.wav)}",
+                    content=self.wav,
+                )
+                self.assertEqual(uploaded.status_code, 200)
+                finish = await client.post(f"/ai/finish?session={session}", json={})
+                self.assertEqual(finish.status_code, 200)
+
+                followup_call = guide.calls[-1]
+                self.assertIn("承接上一轮回答", followup_call["user_question"])
+                self.assertIn("邓公簋", followup_call["user_question"])
+                self.assertIn("著名故事", followup_call["user_question"])
+                self.assertIn("上一轮回答摘要", followup_call["conversation_context"])
 
         asyncio.run(scenario())
 

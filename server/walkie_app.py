@@ -710,7 +710,10 @@ def create_http_app(
             "这个是", "这件是", "做什么用", "什么用途",
             "哪个年代", "什么年代", "有什么故事", "介绍一下",
         )
-        return any(keyword in normalized for keyword in keywords)
+        if any(keyword in normalized for keyword in keywords):
+            return True
+        compacted = _compact_question(normalized)
+        return _looks_like_artifact_pronoun_question(compacted)
 
     def _compact_question(text: str) -> str:
         return "".join(ch for ch in (text or "").strip() if ch not in " \t\r\n，。！？!?,.；;：:\"“”'‘’、")
@@ -733,8 +736,27 @@ def create_http_app(
         }
         if normalized in exact:
             return True
+        if _looks_like_artifact_pronoun_question(normalized):
+            return True
         followup_tokens = ("为什么", "为啥", "为何", "怎么说", "继续", "还有", "详细", "展开", "然后呢")
         return len(normalized) <= 12 and any(token in normalized for token in followup_tokens)
+
+    def _looks_like_artifact_pronoun_question(normalized: str) -> bool:
+        """Catch natural follow-ups such as '他有什么著名故事' after a photo answer."""
+        if not normalized or len(normalized) > 32:
+            return False
+        reference_tokens = (
+            "它", "他", "她", "这个", "这件", "这只", "这一个", "该文物", "此文物",
+            "这个文物", "这件文物", "这个展品", "这件展品", "这个东西", "这件东西",
+        )
+        topic_tokens = (
+            "故事", "典故", "来历", "历史", "背景", "年代", "朝代", "时期",
+            "用途", "用来", "干什么", "做什么", "作用", "价值", "重要", "珍贵",
+            "特别", "厉害", "名字", "名称", "叫什么", "为什么", "为啥", "为何",
+            "出土", "发现", "主人", "谁", "材质", "材料", "纹饰", "花纹", "工艺",
+            "特点", "看点", "寓意", "象征",
+        )
+        return any(token in normalized for token in reference_tokens) and any(token in normalized for token in topic_tokens)
 
     def _get_device_dialog_context(safe_device: str) -> dict | None:
         with app.state.device_dialog_lock:
