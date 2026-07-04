@@ -114,6 +114,8 @@ class VisualMatchService:
         print(
             f"[VISUAL-MATCH] provider={result.provider} match_id={result.match_id} "
             f"match_name={result.match_name} confidence={result.confidence:.2f} "
+            f"best={best.match_id}:{best.confidence:.2f} runner_up={runner_up.match_id}:{runner_up.confidence:.2f} "
+            f"evidence={best.evidence[:180]} "
             f"cost={time.perf_counter() - total_start:.3f}s",
             flush=True,
         )
@@ -194,7 +196,10 @@ class VisualMatchService:
         confidence = max(0.0, min(score / max(normalizer, 0.1), 0.98))
         match_id = str(profile.get("id") or profile.get("candidate_id") or "none").strip() or "none"
         match_name = str(profile.get("standard_name") or profile.get("name") or "无").strip() or "无"
-        evidence_text = "；".join(evidence[:10]) if evidence else "未命中明确视觉特征"
+        evidence_items = evidence[:10]
+        if bonus_evidence and bonus_evidence not in evidence_items:
+            evidence_items = [*evidence_items[:9], bonus_evidence]
+        evidence_text = "；".join(evidence_items) if evidence_items else "未命中明确视觉特征"
         return VisualMatchResult(
             match_id=match_id,
             match_name=match_name,
@@ -305,11 +310,89 @@ def _description_overlap_score(desc: VisualDescription, profile: dict[str, Any])
 
 def _domain_bonus_score(profile: dict[str, Any], query_text: str) -> tuple[float, str]:
     profile_id = str(profile.get("id") or profile.get("candidate_id") or "").strip()
+    if profile_id == "yingguo_yuying":
+        return _feature_group_bonus(
+            profile_name="应国玉鹰",
+            query_text=query_text,
+            groups=[
+                ("展开", ("对称展开", "横向展开", "展翼", "双翼", "翅膀", "翼状")),
+                ("鸟形", ("鸟类", "鸟形", "鹰形", "鸟首", "鹰首", "喙")),
+                ("线刻", ("平行凹槽", "凹槽纹饰", "线刻", "羽毛线条", "平行纹饰")),
+                ("浅色", ("浅米黄", "米黄色", "淡橙色", "米白", "浅黄", "白玉")),
+            ],
+            min_hits=3,
+            bonus=0.52,
+        )
+    if profile_id == "panlongniu_daigai_tonghe":
+        return _feature_group_bonus(
+            profile_name="盘龙钮带盖铜盉",
+            query_text=query_text,
+            groups=[
+                ("带盖", ("带盖", "器盖", "盖顶", "盖钮", "钮")),
+                ("龙钮", ("盘龙", "龙形钮", "龙形装饰", "龙头", "盘绕")),
+                ("盉形", ("盉", "流口", "流", "鋬", "把手", "酒器", "调和酒水")),
+                ("青铜", ("青铜", "铜锈", "金属", "青绿色")),
+            ],
+            min_hits=3,
+            bonus=0.46,
+        )
     if profile_id == "denggong_gui":
-        terms = ("球形", "圆润", "带盖", "盖子", "盖顶", "环耳", "双耳", "弦纹", "环带", "圈足")
-        hits = [term for term in terms if term in query_text]
-        if len(hits) >= 4:
-            return 0.46, f"组合特征:邓公簋({'/'.join(hits[:5])})"
+        return _feature_group_bonus(
+            profile_name="邓公簋",
+            query_text=query_text,
+            groups=[
+                ("圆球", ("球形", "圆球", "圆润", "圆罐")),
+                ("带盖", ("带盖", "盖子", "盖顶", "器盖", "半球形盖")),
+                ("双耳", ("环耳", "双耳", "两侧耳", "环形耳")),
+                ("纹带", ("弦纹", "环带", "卷云纹", "兽面纹", "凹槽")),
+                ("圈足", ("圈足", "底座", "三足底座")),
+            ],
+            min_hits=4,
+            bonus=0.46,
+        )
+    if profile_id == "lushan_huaci_sanzuxi":
+        return _feature_group_bonus(
+            profile_name="黑釉蓝斑花口三足洗",
+            query_text=query_text,
+            groups=[
+                ("黑釉", ("黑釉", "深黑", "墨绿", "黑色釉")),
+                ("蓝斑", ("蓝斑", "蓝色斑", "蓝紫", "花釉", "窑变")),
+                ("花口", ("花口", "波浪形", "花瓣", "八瓣")),
+                ("三足", ("三足", "兽首足", "足支撑")),
+                ("洗形", ("洗", "瓷碗", "浅腹", "敞口")),
+            ],
+            min_hits=3,
+            bonus=0.48,
+        )
+    if profile_id == "shuyao_chuilinwen_shengding":
+        return _feature_group_bonus(
+            profile_name="束腰垂鳞纹升鼎",
+            query_text=query_text,
+            groups=[
+                ("鼎形", ("鼎", "圆鼎", "敞口", "腹腔")),
+                ("三足", ("三足", "柱形足", "足端")),
+                ("双耳", ("双耳", "环耳", "兽首环耳", "把手")),
+                ("垂鳞", ("垂鳞", "鳞纹", "鳞片")),
+                ("束腰", ("束腰", "收束", "器身收腰")),
+                ("蟠螭", ("蟠螭", "龙形怪兽", "浮雕纹饰", "兽面纹")),
+            ],
+            min_hits=4,
+            bonus=0.46,
+        )
+    return 0.0, ""
+
+
+def _feature_group_bonus(
+    *,
+    profile_name: str,
+    query_text: str,
+    groups: list[tuple[str, tuple[str, ...]]],
+    min_hits: int,
+    bonus: float,
+) -> tuple[float, str]:
+    hits = [label for label, terms in groups if any(term in query_text for term in terms)]
+    if len(hits) >= min_hits:
+        return bonus, f"组合特征:{profile_name}({'/'.join(hits)})"
     return 0.0, ""
 
 
