@@ -71,6 +71,7 @@ class GuideAnswerService:
         user_question: str = "这是什么",
         device: str = "",
         image_id: str = "",
+        conversation_context: str = "",
     ) -> GuideAnswerResult:
         mode, gate_reason = _choose_mode(desc, match)
         print(f"[GUIDE] mode={mode} gate_reason={gate_reason}", flush=True)
@@ -88,13 +89,16 @@ class GuideAnswerService:
                     match.match_id,
                     match.match_name,
                 )
-            answer = self._ask_specific(desc, match, card, user_question=user_question, device=device, image_id=image_id)
+            answer = self._ask_specific(
+                desc, match, card, user_question=user_question,
+                device=device, image_id=image_id, conversation_context=conversation_context,
+            )
             if _is_valid(answer):
                 return GuideAnswerResult(mode, card is not None, _clean(answer), gate_reason, match.match_id, match.match_name)
             return self._fallback_specific(match, card, gate_reason)
         if _is_identity_question(user_question):
             return _fallback_category(desc, f"{gate_reason}；本地类别快速回答")
-        return self._build_category_answer(desc, gate_reason, user_question=user_question)
+        return self._build_category_answer(desc, gate_reason, user_question=user_question, conversation_context=conversation_context)
 
     async def build_answer_async(
         self,
@@ -104,6 +108,7 @@ class GuideAnswerService:
         user_question: str = "这是什么",
         device: str = "",
         image_id: str = "",
+        conversation_context: str = "",
     ) -> GuideAnswerResult:
         mode, gate_reason = _choose_mode(desc, match)
         print(f"[GUIDE] mode={mode} gate_reason={gate_reason}", flush=True)
@@ -121,13 +126,18 @@ class GuideAnswerService:
                     match.match_id,
                     match.match_name,
                 )
-            answer = await self._ask_specific_async(desc, match, card, user_question=user_question, device=device, image_id=image_id)
+            answer = await self._ask_specific_async(
+                desc, match, card, user_question=user_question,
+                device=device, image_id=image_id, conversation_context=conversation_context,
+            )
             if _is_valid(answer):
                 return GuideAnswerResult(mode, card is not None, _clean(answer), gate_reason, match.match_id, match.match_name)
             return self._fallback_specific(match, card, gate_reason)
         if _is_identity_question(user_question):
             return _fallback_category(desc, f"{gate_reason}；本地类别快速回答")
-        return await self._build_category_answer_async(desc, gate_reason, user_question=user_question)
+        return await self._build_category_answer_async(
+            desc, gate_reason, user_question=user_question, conversation_context=conversation_context,
+        )
 
     def _ask_specific(
         self,
@@ -138,10 +148,13 @@ class GuideAnswerService:
         user_question: str,
         device: str,
         image_id: str,
+        conversation_context: str,
     ) -> str:
         if self.bailian_app_service is None:
             return ""
-        return self.bailian_app_service.ask(self._specific_prompt(desc, match, card, user_question=user_question))
+        return self.bailian_app_service.ask(
+            self._specific_prompt(desc, match, card, user_question=user_question, conversation_context=conversation_context)
+        )
 
     async def _ask_specific_async(
         self,
@@ -152,10 +165,13 @@ class GuideAnswerService:
         user_question: str,
         device: str,
         image_id: str,
+        conversation_context: str,
     ) -> str:
         if self.bailian_app_service is None:
             return ""
-        return await self.bailian_app_service.ask_async(self._specific_prompt(desc, match, card, user_question=user_question))
+        return await self.bailian_app_service.ask_async(
+            self._specific_prompt(desc, match, card, user_question=user_question, conversation_context=conversation_context)
+        )
 
     def _specific_prompt(
         self,
@@ -164,6 +180,7 @@ class GuideAnswerService:
         card: ExhibitCard | None,
         *,
         user_question: str,
+        conversation_context: str = "",
     ) -> str:
         cleaned_question = _clean(user_question) or "这是什么"
         card_context = card.to_prompt_context(cleaned_question) if card else "本地文物卡片缺失，只能依据视觉特征做保守讲解。"
@@ -172,8 +189,12 @@ class GuideAnswerService:
         ) or desc.visual_description[:120]
         confidence_hint = "中等，需保守表达" if match.confidence < 0.8 else "较高，但不要绝对化"
         evidence = _short_text(match.evidence or "视觉特征吻合", 140)
+        conversation_block = ""
+        if conversation_context.strip():
+            conversation_block = f"上一轮对话背景：{_short_text(_clean(conversation_context), 420)}\n"
         return (
             "请根据以下本轮数据生成最终语音导游回答。\n\n"
+            f"{conversation_block}"
             f"游客问题：{cleaned_question}。\n"
             f"本轮回答策略：{_answer_style(cleaned_question)}。\n"
             f"视觉匹配：{match.match_name}；置信度：{match.confidence:.2f}；可靠性：{confidence_hint}。\n"
@@ -197,24 +218,40 @@ class GuideAnswerService:
             answer = f"这件展品很像{match.match_name}。你可以先关注它的材质、造型和纹饰，再结合现场展签确认具体名称。"
         return GuideAnswerResult(SPECIFIC_MODE, card is not None, _clean(answer), f"{gate_reason}；本地降级讲解", match.match_id, match.match_name)
 
-    def _ask_category(self, desc: VisualDescription, *, user_question: str) -> str:
+    def _ask_category(self, desc: VisualDescription, *, user_question: str, conversation_context: str) -> str:
         if self.bailian_app_service is None:
             return ""
-        return self.bailian_app_service.ask(_category_prompt(desc, user_question=user_question))
+        return self.bailian_app_service.ask(_category_prompt(desc, user_question=user_question, conversation_context=conversation_context))
 
-    async def _ask_category_async(self, desc: VisualDescription, *, user_question: str) -> str:
+    async def _ask_category_async(self, desc: VisualDescription, *, user_question: str, conversation_context: str) -> str:
         if self.bailian_app_service is None:
             return ""
-        return await self.bailian_app_service.ask_async(_category_prompt(desc, user_question=user_question))
+        return await self.bailian_app_service.ask_async(
+            _category_prompt(desc, user_question=user_question, conversation_context=conversation_context)
+        )
 
-    def _build_category_answer(self, desc: VisualDescription, gate_reason: str, *, user_question: str) -> GuideAnswerResult:
-        answer = self._ask_category(desc, user_question=user_question)
+    def _build_category_answer(
+        self,
+        desc: VisualDescription,
+        gate_reason: str,
+        *,
+        user_question: str,
+        conversation_context: str,
+    ) -> GuideAnswerResult:
+        answer = self._ask_category(desc, user_question=user_question, conversation_context=conversation_context)
         if _is_valid(answer):
             return GuideAnswerResult(CATEGORY_MODE, False, _clean(answer), gate_reason)
         return _fallback_category(desc, gate_reason)
 
-    async def _build_category_answer_async(self, desc: VisualDescription, gate_reason: str, *, user_question: str) -> GuideAnswerResult:
-        answer = await self._ask_category_async(desc, user_question=user_question)
+    async def _build_category_answer_async(
+        self,
+        desc: VisualDescription,
+        gate_reason: str,
+        *,
+        user_question: str,
+        conversation_context: str,
+    ) -> GuideAnswerResult:
+        answer = await self._ask_category_async(desc, user_question=user_question, conversation_context=conversation_context)
         if _is_valid(answer):
             return GuideAnswerResult(CATEGORY_MODE, False, _clean(answer), gate_reason)
         return _fallback_category(desc, gate_reason)
@@ -263,12 +300,16 @@ def guide_response_payload(
     }
 
 
-def _category_prompt(desc: VisualDescription, *, user_question: str) -> str:
+def _category_prompt(desc: VisualDescription, *, user_question: str, conversation_context: str = "") -> str:
     themes = CATEGORY_THEMES.get(desc.category, "平顶山博物馆展览主题")
     features = "、".join(desc.shape_features[:3] + desc.decoration_features[:3]) or "无"
     cleaned_question = _clean(user_question) or "这是什么"
+    conversation_block = ""
+    if conversation_context.strip():
+        conversation_block = f"上一轮对话背景：{_short_text(_clean(conversation_context), 420)}\n"
     return (
         "请根据以下本轮数据生成最终语音导游回答。\n\n"
+        f"{conversation_block}"
         "具体文物名称：暂未确认。\n"
         f"游客问题：{cleaned_question}。\n"
         f"本轮回答策略：{_answer_style(cleaned_question)}。\n"
@@ -303,6 +344,8 @@ def _answer_style(question: str) -> str:
     question = question or ""
     if _is_identity_question(question):
         return "简单识别问题，1到2句话，通常不需要追问引导"
+    if any(token in question for token in ("追问", "为什么", "为何", "为啥", "怎么说", "继续", "还有呢", "详细点")):
+        return "承接上一轮的追问，直接补原因或展开背景，不要说不知道用户在问什么，可自然收束"
     if any(token in question for token in ("故事", "历史", "讲讲", "介绍", "详细", "为什么重要", "特别")):
         return "展开型问题，可讲背景、重要性和看点，可自然给一个相关追问"
     return "单点问题，2到4句话，直接回答，可不引导"

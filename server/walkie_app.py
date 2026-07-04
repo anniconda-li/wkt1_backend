@@ -183,6 +183,8 @@ def create_http_app(
     app.state.voice_qa_service = VoiceQaService(bailian_qa)
     # 缓存最新视觉描述（替代旧版 latest_image_analysis）
     app.state.latest_visual_descriptions: dict[str, dict] = {}
+    app.state.device_dialog_lock = threading.Lock()
+    app.state.device_dialog_contexts: dict[str, dict] = {}
 
     @app.get("/healthz")
     async def healthz() -> dict[str, object]:
@@ -419,8 +421,8 @@ def create_http_app(
                 log(f"ASR 结果因会话已取消而被忽略 session={ai_session.session_id}")
                 return "", ""
 
-        # 判断是否为"最新图片"相关提问
-        if is_latest_image_question(asr_text):
+        # 判断是否为"最新图片"相关提问，或承接上一轮图片讲解的省略式追问。
+        if is_latest_image_question(asr_text) or is_contextual_image_followup(ai_session.device, asr_text):
             with app.state.ai_sessions_lock:
                 if is_session_canceled(ai_session):
                     log(f"图片回答跳过 因会话已取消 session={ai_session.session_id}")
@@ -710,6 +712,92 @@ def create_http_app(
         )
         return any(keyword in normalized for keyword in keywords)
 
+    def _compact_question(text: str) -> str:
+        return "".join(ch for ch in (text or "").strip() if ch not in " \t\r\n，。！？!?,.；;：:\"“”'‘’、")
+
+    def _short_context(text: str, limit: int = 220) -> str:
+        cleaned = " ".join((text or "").strip().split())
+        if len(cleaned) <= limit:
+            return cleaned
+        return cleaned[:limit].rstrip() + "..."
+
+    def is_contextual_followup_text(text: str) -> bool:
+        """Return true for short elliptical follow-up questions."""
+        normalized = _compact_question(text)
+        if not normalized:
+            return False
+        exact = {
+            "为什么", "为啥", "为何", "为什么呢", "怎么说", "什么意思",
+            "继续", "接着说", "继续讲", "还有呢", "还有吗", "详细点",
+            "展开讲讲", "然后呢", "那呢", "它呢", "这个呢", "所以呢",
+        }
+        if normalized in exact:
+            return True
+        followup_tokens = ("为什么", "为啥", "为何", "怎么说", "继续", "还有", "详细", "展开", "然后呢")
+        return len(normalized) <= 12 and any(token in normalized for token in followup_tokens)
+
+    def _get_device_dialog_context(safe_device: str) -> dict | None:
+        with app.state.device_dialog_lock:
+            context = app.state.device_dialog_contexts.get(safe_device)
+            if context is None and safe_device != "walkie-01":
+                context = app.state.device_dialog_contexts.get("walkie-01")
+            return dict(context) if isinstance(context, dict) else None
+
+    def _save_device_dialog_context(
+        safe_device: str,
+        *,
+        image_id: str,
+        match: VisualMatchResult,
+        original_question: str,
+        resolved_question: str,
+        answer_text: str,
+    ) -> None:
+        with app.state.device_dialog_lock:
+            app.state.device_dialog_contexts[safe_device] = {
+                "image_id": image_id,
+                "match_id": match.match_id,
+                "match_name": match.match_name,
+                "last_user_question": original_question,
+                "last_resolved_question": resolved_question,
+                "last_answer": answer_text,
+                "updated_at": datetime.now(),
+            }
+
+    def _dialog_context_matches_image(context: dict | None, image_id: str) -> bool:
+        return isinstance(context, dict) and str(context.get("image_id") or "") == image_id
+
+    def is_contextual_image_followup(safe_device: str, text: str) -> bool:
+        if not is_contextual_followup_text(text):
+            return False
+        cached = _get_ready_camera_context(safe_device)
+        if not isinstance(cached, dict):
+            return False
+        return _dialog_context_matches_image(_get_device_dialog_context(safe_device), str(cached.get("image_id") or ""))
+
+    def _resolve_contextual_followup_question(question: str, context: dict, match: VisualMatchResult) -> str:
+        normalized = _compact_question(question)
+        exhibit = match.match_name if match.match_id != "none" and match.match_name != "无" else "这件文物"
+        if any(token in normalized for token in ("为什么", "为啥", "为何")):
+            if any(token in normalized for token in ("叫", "名字", "名称")):
+                return f"请承接上一轮回答，解释{exhibit}的名称或叫法为什么这样。"
+            if any(token in normalized for token in ("重要", "特别", "珍贵")):
+                return f"请承接上一轮回答，解释{exhibit}为什么重要、特别或珍贵。"
+            return f"请承接上一轮回答，解释{exhibit}为什么重要，以及刚才提到的看点背后的原因。"
+        if any(token in normalized for token in ("继续", "接着", "还有", "详细", "展开", "然后")):
+            return f"请承接上一轮回答，继续介绍{exhibit}，重点补充历史背景、用途和一个有意思的看点。"
+        if any(token in normalized for token in ("怎么说", "什么意思", "所以")):
+            return f"请承接上一轮回答，把刚才关于{exhibit}的说法解释得更明白。"
+        return f"请承接上一轮回答，围绕{exhibit}回答游客的追问：{question}"
+
+    def _build_dialog_prompt_context(context: dict, original_question: str) -> str:
+        return (
+            f"游客正在追问上一轮导游回答。"
+            f"上一轮文物：{context.get('match_name') or context.get('match_id') or '未确认'}。"
+            f"上一轮问题：{_short_context(str(context.get('last_resolved_question') or context.get('last_user_question') or ''), 100)}。"
+            f"上一轮回答摘要：{_short_context(str(context.get('last_answer') or ''), 240)}。"
+            f"本轮原始追问：{original_question or '继续追问'}。"
+        )
+
     async def answer_latest_image_question(safe_device: str, user_question: str) -> str:
         """回答关于最新图片的问题。
 
@@ -739,8 +827,32 @@ def create_http_app(
             f"match_id={match.match_id} match_name={match.match_name} confidence={match.confidence:.2f}"
         )
 
+        resolved_question = user_question
+        conversation_context = ""
+        dialog_context = _get_device_dialog_context(safe_device)
+        if _dialog_context_matches_image(dialog_context, image_id) and is_contextual_followup_text(user_question):
+            resolved_question = _resolve_contextual_followup_question(user_question, dialog_context, match)
+            conversation_context = _build_dialog_prompt_context(dialog_context, user_question)
+            log(
+                f"[CAMERA] 省略追问承接 device={safe_device} image_id={image_id} "
+                f"raw={user_question!r} resolved={resolved_question!r}"
+            )
+
         guide = await app.state.guide_answer_service.build_answer_async(
-            desc, match, user_question=user_question, device=safe_device, image_id=image_id,
+            desc,
+            match,
+            user_question=resolved_question,
+            device=safe_device,
+            image_id=image_id,
+            conversation_context=conversation_context,
+        )
+        _save_device_dialog_context(
+            safe_device,
+            image_id=image_id,
+            match=match,
+            original_question=user_question,
+            resolved_question=resolved_question,
+            answer_text=guide.answer_text,
         )
         log(
             f"[CAMERA] 导游讲解 device={safe_device} image_id={image_id} "
@@ -1348,6 +1460,14 @@ def create_http_app(
         guide_start = time.perf_counter()
         guide = await app.state.guide_answer_service.build_answer_async(
             desc, match, user_question="这是什么", device=safe_device, image_id=image_id,
+        )
+        _save_device_dialog_context(
+            safe_device,
+            image_id=image_id,
+            match=match,
+            original_question="这是什么",
+            resolved_question="这是什么",
+            answer_text=guide.answer_text,
         )
         log(
             f"[CAMERA] 导游讲解 image_id={image_id} mode={guide.mode} grounded={int(guide.grounded)} "

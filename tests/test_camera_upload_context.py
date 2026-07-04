@@ -4,21 +4,37 @@ from __future__ import annotations
 
 import asyncio
 import os
+import struct
 import sys
 import threading
 import unittest
+import wave
+from io import BytesIO
 from pathlib import Path
 
 import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import server.walkie_app as walkie_app
 from server.walkie_app import create_http_app
+from services.guide_answer_service import GuideAnswerResult
 from services.vision_service import VisualDescription
 from services.visual_match_service import VisualMatchResult
 
 
 TEST_IMAGE = Path(__file__).resolve().parent / "data" / "camera" / "yingguo_yuying.jpg"
+
+
+def make_wav() -> bytes:
+    pcm = struct.pack("<" + "h" * 1600, *([0] * 1600))
+    out = BytesIO()
+    with wave.open(out, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(pcm)
+    return out.getvalue()
 
 
 class BlockingVisionService:
@@ -63,15 +79,54 @@ class FakeVisualMatchService:
         )
 
 
+class RecordingGuideAnswerService:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, str]] = []
+
+    async def build_answer_async(
+        self,
+        desc: VisualDescription,
+        match: VisualMatchResult,
+        *,
+        user_question: str = "这是什么",
+        device: str = "",
+        image_id: str = "",
+        conversation_context: str = "",
+    ) -> GuideAnswerResult:
+        self.calls.append(
+            {
+                "user_question": user_question,
+                "device": device,
+                "image_id": image_id,
+                "conversation_context": conversation_context,
+            }
+        )
+        return GuideAnswerResult(
+            "specific_explain",
+            True,
+            f"测试回答：{user_question}",
+            "test",
+            match.match_id,
+            match.match_name,
+        )
+
+
 class CameraUploadContextTest(unittest.TestCase):
     def setUp(self) -> None:
         os.environ["CAMERA_UPLOAD_TIMEOUT"] = "5"
+        os.environ["AUTO_TTS_BACKGROUND"] = "false"
+        os.environ["TOUR_MODE"] = "asr_bailian_app"
+        self._old_transcribe = walkie_app.transcribe_wav
         root = Path("tmp/debug/test_camera_upload_context")
         self.app = create_http_app(root / "wav", root / "jpg", 1, False)
         self.vision = BlockingVisionService()
         self.app.state.vision_service = self.vision
         self.app.state.visual_match = FakeVisualMatchService()
         self.jpeg = TEST_IMAGE.read_bytes()
+        self.wav = make_wav()
+
+    def tearDown(self) -> None:
+        walkie_app.transcribe_wav = self._old_transcribe
 
     async def _client(self) -> httpx.AsyncClient:
         transport = httpx.ASGITransport(app=self.app)
@@ -165,6 +220,42 @@ class CameraUploadContextTest(unittest.TestCase):
                 self.vision.release_first.set()
                 second_response = await second
                 self.assertEqual(second_response.status_code, 200)
+
+        asyncio.run(scenario())
+
+    def test_short_followup_uses_previous_image_answer_context(self) -> None:
+        async def scenario() -> None:
+            guide = RecordingGuideAnswerService()
+            self.app.state.guide_answer_service = guide
+            walkie_app.transcribe_wav = lambda _path: "为什么"
+
+            async with await self._client() as client:
+                self.vision.release_first.set()
+                upload = await client.post(
+                    "/camera/upload?device=test-camera",
+                    content=self.jpeg,
+                    headers={"Content-Type": "image/jpeg"},
+                )
+                self.assertEqual(upload.status_code, 200)
+
+                first_answer = await client.post("/camera/analyze_latest?device=test-camera")
+                self.assertEqual(first_answer.status_code, 200)
+                self.assertEqual(guide.calls[-1]["user_question"], "这是什么")
+
+                start = await client.post("/ai/start", json={"device": "test-camera"})
+                session = start.json()["session"]
+                uploaded = await client.post(
+                    f"/ai/upload?session={session}&index=0&offset=0&total={len(self.wav)}",
+                    content=self.wav,
+                )
+                self.assertEqual(uploaded.status_code, 200)
+                finish = await client.post(f"/ai/finish?session={session}", json={})
+                self.assertEqual(finish.status_code, 200)
+
+                followup_call = guide.calls[-1]
+                self.assertIn("承接上一轮回答", followup_call["user_question"])
+                self.assertIn("上一轮回答摘要", followup_call["conversation_context"])
+                self.assertNotEqual(followup_call["user_question"], "为什么")
 
         asyncio.run(scenario())
 
