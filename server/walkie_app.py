@@ -89,6 +89,7 @@ DEFAULT_CHUNK_SIZE = 32768
 # AI 回复重复次数和额外数据块开关
 DEFAULT_AI_REPLY_REPEAT = 1
 DEFAULT_AI_REPLY_EXTRA_CHUNK = False
+DEFAULT_CAMERA_UPLOAD_TIMEOUT = 25.0
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,15 @@ def auto_tts_background_enabled() -> bool:
     """
     value = os.getenv("AUTO_TTS_BACKGROUND", "true").strip().lower()
     return value in {"1", "true", "yes", "on"}
+
+
+def camera_upload_timeout_seconds() -> float:
+    """Return the maximum time a camera upload may spend before replying."""
+    raw = os.getenv("CAMERA_UPLOAD_TIMEOUT", str(DEFAULT_CAMERA_UPLOAD_TIMEOUT)).strip()
+    try:
+        return max(float(raw), 1.0)
+    except ValueError:
+        return DEFAULT_CAMERA_UPLOAD_TIMEOUT
 
 
 # =============================================================================
@@ -150,6 +160,9 @@ def create_http_app(
     # 最近相机图片缓存
     app.state.latest_images = {}
     app.state.latest_image_analysis = {}
+    app.state.camera_upload_lock = threading.Lock()
+    app.state.camera_upload_generations: dict[str, int] = {}
+    app.state.latest_camera_uploads: dict[str, dict] = {}
     # AI 回复参数
     app.state.ai_reply_repeat = max(ai_reply_repeat, 1)
     app.state.ai_reply_extra_chunk = ai_reply_extra_chunk
@@ -476,6 +489,163 @@ def create_http_app(
     # 相机视觉分析
     # =========================================================================
 
+    def _begin_camera_upload(
+        safe_device: str,
+        image_id: str,
+        image_path: Path,
+        *,
+        width: int,
+        height: int,
+        jpeg_len: int,
+    ) -> int:
+        """Mark a new upload as the latest generation for this device."""
+        with app.state.camera_upload_lock:
+            generation = int(app.state.camera_upload_generations.get(safe_device, 0)) + 1
+            app.state.camera_upload_generations[safe_device] = generation
+            app.state.latest_camera_uploads[safe_device] = {
+                "generation": generation,
+                "upload_id": image_id,
+                "image_id": image_id,
+                "path": image_path,
+                "time": datetime.now(),
+                "status": "pending",
+                "width": width,
+                "height": height,
+                "jpeg_len": jpeg_len,
+            }
+        log(f"[CAMERA] upload received device={safe_device} image_id={image_id} generation={generation} jpeg_len={jpeg_len}")
+        return generation
+
+    def _is_current_camera_upload(safe_device: str, image_id: str, generation: int) -> bool:
+        with app.state.camera_upload_lock:
+            latest = app.state.latest_camera_uploads.get(safe_device)
+            return (
+                isinstance(latest, dict)
+                and latest.get("image_id") == image_id
+                and latest.get("generation") == generation
+                and latest.get("status") == "pending"
+            )
+
+    def _mark_camera_upload_failed(safe_device: str, image_id: str, generation: int, reason: str) -> None:
+        with app.state.camera_upload_lock:
+            latest = app.state.latest_camera_uploads.get(safe_device)
+            if (
+                isinstance(latest, dict)
+                and latest.get("image_id") == image_id
+                and latest.get("generation") == generation
+            ):
+                latest["status"] = "failed"
+                latest["error"] = reason
+                latest["failed_at"] = datetime.now()
+
+    def _invalidate_camera_upload(safe_device: str, reason: str) -> dict:
+        """Invalidate the current pending upload for a device."""
+        with app.state.camera_upload_lock:
+            generation = int(app.state.camera_upload_generations.get(safe_device, 0)) + 1
+            app.state.camera_upload_generations[safe_device] = generation
+            canceled = {
+                "generation": generation,
+                "upload_id": f"cancel_{generation}",
+                "image_id": "",
+                "time": datetime.now(),
+                "status": "canceled",
+                "reason": reason,
+            }
+            app.state.latest_camera_uploads[safe_device] = canceled
+            return canceled
+
+    def _commit_ready_camera_context(
+        safe_device: str,
+        image_id: str,
+        generation: int,
+        image_path: Path,
+        *,
+        width: int,
+        height: int,
+        desc: VisualDescription,
+        match: VisualMatchResult,
+    ) -> bool:
+        """Write the ready image context only if this upload is still latest."""
+        cache_entry = {
+            "image_id": image_id,
+            "upload_id": image_id,
+            "generation": generation,
+            "path": image_path,
+            "time": datetime.now(),
+            "status": "ready",
+            "description": desc,
+            "match": match,
+            "error": "",
+        }
+        latest_image = {
+            "image_id": image_id,
+            "upload_id": image_id,
+            "generation": generation,
+            "path": image_path,
+            "time": datetime.now(),
+            "width": width,
+            "height": height,
+            "status": "ready",
+        }
+        with app.state.camera_upload_lock:
+            latest = app.state.latest_camera_uploads.get(safe_device)
+            if (
+                not isinstance(latest, dict)
+                or latest.get("image_id") != image_id
+                or latest.get("generation") != generation
+                or latest.get("status") != "pending"
+            ):
+                log(
+                    f"[CAMERA] stale upload ignored device={safe_device} image_id={image_id} "
+                    f"generation={generation} latest={latest}"
+                )
+                return False
+            app.state.latest_images[safe_device] = latest_image
+            app.state.latest_visual_descriptions[safe_device] = cache_entry
+            app.state.latest_image_analysis[safe_device] = cache_entry
+            latest.update(
+                {
+                    "status": "ready",
+                    "ready_at": datetime.now(),
+                    "match_id": match.match_id,
+                    "match_name": match.match_name,
+                    "match_confidence": match.confidence,
+                }
+            )
+        log(
+            f"[CAMERA] context ready device={safe_device} image_id={image_id} generation={generation} "
+            f"match_id={match.match_id} match_name={match.match_name} confidence={match.confidence:.2f}"
+        )
+        return True
+
+    def _get_ready_camera_context(safe_device: str) -> dict | None:
+        """Return the current ready context for a device, never a pending upload."""
+        with app.state.camera_upload_lock:
+            latest = app.state.latest_camera_uploads.get(safe_device)
+            cached = app.state.latest_visual_descriptions.get(safe_device)
+            if (
+                isinstance(latest, dict)
+                and isinstance(cached, dict)
+                and latest.get("status") == "ready"
+                and cached.get("status") == "ready"
+                and cached.get("image_id") == latest.get("image_id")
+                and cached.get("generation") == latest.get("generation")
+            ):
+                return dict(cached)
+            if safe_device != "walkie-01" and latest is None:
+                fallback_latest = app.state.latest_camera_uploads.get("walkie-01")
+                fallback_cached = app.state.latest_visual_descriptions.get("walkie-01")
+                if (
+                    isinstance(fallback_latest, dict)
+                    and isinstance(fallback_cached, dict)
+                    and fallback_latest.get("status") == "ready"
+                    and fallback_cached.get("status") == "ready"
+                    and fallback_cached.get("image_id") == fallback_latest.get("image_id")
+                    and fallback_cached.get("generation") == fallback_latest.get("generation")
+                ):
+                    return dict(fallback_cached)
+        return None
+
     async def analyze_camera_observation(
         safe_device: str,
         image_id: str,
@@ -483,10 +653,11 @@ def create_http_app(
         *,
         background_match: bool = True,
     ) -> VisualDescription:
-        """分析相机上传的图片，缓存视觉描述，并异步触发本地视觉匹配。
+        """Analyze an uploaded camera image without writing latest context.
 
-        视觉分析和本地视觉匹配都在上传阶段完成，
-        用户提问时直接使用缓存结果，只需等待问答生成（~8s）。
+        The ready context is committed only after visual matching succeeds and
+        the upload generation is still current. This prevents half-finished
+        image context from being used by later Q&A.
 
         Args:
             safe_device: 设备标识
@@ -496,63 +667,22 @@ def create_http_app(
         Returns:
             VisualDescription: 纯视觉描述
         """
+        _ = background_match
         vision_start = time.perf_counter()
+        log(f"[CAMERA] vision start device={safe_device} image_id={image_id} file={image_path}")
         try:
             desc = await asyncio.to_thread(app.state.vision_service.analyze_image, image_path)
-            status = "ready" if desc.is_clear and desc.category not in ("无法判断", "未知") else "retake"
-            error = ""
         except Exception as exc:
             logger.exception("[CAMERA] 视觉识别失败 device=%s image_id=%s", safe_device, image_id)
-            desc = VisualDescription(risk=f"视觉识别异常：{exc}", is_clear=False)
-            status = "failed"
-            error = str(exc)[:300]
-
-        # 缓存视觉描述
-        cache_entry = {
-            "image_id": image_id,
-            "path": image_path,
-            "time": datetime.now(),
-            "status": status,
-            "description": desc,
-            "match": None,  # 待本地视觉匹配填充
-            "error": error,
-        }
-        app.state.latest_visual_descriptions[safe_device] = cache_entry
-        # 向后兼容
-        app.state.latest_image_analysis[safe_device] = cache_entry
-
+            raise RuntimeError(f"vision failed: {exc}") from exc
+        status = "ready" if desc.is_clear and desc.category not in ("无法判断", "未知") else "not_ready"
         log(
-            f"[CAMERA] 视觉描述 image_id={image_id} status={status} "
+            f"[CAMERA] vision end device={safe_device} image_id={image_id} status={status} "
             f"category={desc.category} is_clear={desc.is_clear} "
             f"confidence={desc.confidence:.2f} desc_len={len(desc.visual_description)} "
             f"cost={time.perf_counter() - vision_start:.3f}s"
         )
-
-        # 图片清晰且类别可辨时，立即做本地视觉匹配（用户拍照到提问间隙完成）
-        if status == "ready" and background_match:
-            asyncio.create_task(_background_match(safe_device, image_id, desc, cache_entry))
-
         return desc
-
-    async def _background_match(safe_device: str, image_id: str, desc: VisualDescription, cache_entry: dict) -> None:
-        """后台执行本地视觉匹配，结果写入缓存。
-
-        在上传阶段异步执行，不阻塞 HTTP 响应。
-        用户提问时直接读取缓存中的 match 结果。
-        """
-        match_start = time.perf_counter()
-        try:
-            match = await app.state.visual_match.match_async(desc)
-        except Exception as exc:
-            logger.exception("[CAMERA] 后台本地视觉匹配失败 device=%s image_id=%s", safe_device, image_id)
-            match = VisualMatchResult(evidence=f"匹配异常: {exc}")
-        cost = time.perf_counter() - match_start
-        cache_entry["match"] = match
-        log(
-            f"[CAMERA] 后台本地视觉匹配完成 device={safe_device} image_id={image_id} "
-            f"match_id={match.match_id} match_name={match.match_name} "
-            f"confidence={match.confidence:.2f} cost={cost:.3f}s"
-        )
 
     def is_latest_image_question(text: str) -> bool:
         """判断用户问题是否在询问最新拍摄的图片。
@@ -592,9 +722,7 @@ def create_http_app(
         Returns:
             str: 导游讲解文本
         """
-        cached = app.state.latest_visual_descriptions.get(safe_device)
-        if cached is None and safe_device != "walkie-01":
-            cached = app.state.latest_visual_descriptions.get("walkie-01")
+        cached = _get_ready_camera_context(safe_device)
         if not isinstance(cached, dict):
             return "我还没有收到可以讲解的照片。你可以先拍一张展品，尽量让展品居中，再来问我。"
 
@@ -603,11 +731,9 @@ def create_http_app(
         if not isinstance(desc, VisualDescription):
             return "这张照片信息不太够。请把展品放在画面中间，靠近一点，避开展柜反光后重拍。"
 
-        # 取缓存的本地匹配结果；若后台匹配尚未完成则同步执行
         match = cached.get("match")
         if not isinstance(match, VisualMatchResult):
-            log(f"[CAMERA] 后台匹配未完成，同步执行 device={safe_device} image_id={image_id}")
-            match = await app.state.visual_match.match_async(desc)
+            return "这张照片信息还不够完整。你可以重新拍一张展品，再继续问我。"
         log(
             f"[CAMERA] 使用缓存匹配结果 device={safe_device} image_id={image_id} "
             f"match_id={match.match_id} match_name={match.match_name} confidence={match.confidence:.2f}"
@@ -981,109 +1107,203 @@ def create_http_app(
         """
         body = await request.body()
         await log_request(request, body, "camera_upload")
+        safe_device = device or "walkie-01"
         if "image/jpeg" not in content_type.lower() and "image/jpg" not in content_type.lower():
             log(f"Camera 上传 content-type 警告: {content_type!r}")
 
         # 验证并保存 JPEG
         ok, save_path, jpeg = validate_and_log_jpeg(body, app.state.jpg_save_dir, "Camera upload")
         if not ok or save_path is None:
+            log(f"[CAMERA] upload failed device={safe_device} reason=invalid_jpeg jpeg_len={len(body)}")
             return JSONResponse(
                 {
                     "ok": False,
                     "error": "invalid jpeg",
-                    "len": len(body),
-                    "file": save_path.as_posix() if save_path else "",
+                    "message": "invalid jpeg",
                 },
                 status_code=400,
             )
 
         width = jpeg.width if jpeg and jpeg.width is not None else 0
         height = jpeg.height if jpeg and jpeg.height is not None else 0
-        safe_device = device or "walkie-01"
         image_id = save_path.stem
+        generation = _begin_camera_upload(
+            safe_device,
+            image_id,
+            save_path,
+            width=width,
+            height=height,
+            jpeg_len=len(body),
+        )
+        log(f"[CAMERA] image saved device={safe_device} image_id={image_id} generation={generation} file={save_path}")
 
-        # 缓存最新图片
-        app.state.latest_images[safe_device] = {
-            "image_id": image_id,
-            "path": save_path,
-            "time": datetime.now(),
-            "width": width,
-            "height": height,
-        }
-        log(f"Camera 最新图片已更新 device={safe_device} image_id={image_id} file={save_path}")
+        async def build_ready_response() -> JSONResponse:
+            if await request.is_disconnected():
+                _mark_camera_upload_failed(safe_device, image_id, generation, "client_disconnected")
+                log(f"[CAMERA] upload failed device={safe_device} image_id={image_id} generation={generation} reason=client_disconnected")
+                return JSONResponse(
+                    {"ok": False, "image_id": image_id, "error": "client disconnected", "message": "client disconnected"},
+                    status_code=499,
+                )
+            if not _is_current_camera_upload(safe_device, image_id, generation):
+                log(f"[CAMERA] stale upload ignored device={safe_device} image_id={image_id} generation={generation} stage=before_vision")
+                return JSONResponse(
+                    {"ok": False, "image_id": image_id, "error": "stale upload", "message": "superseded"},
+                    status_code=409,
+                )
 
-        # 视觉分析。设备端不会轮询图片状态，因此这里在返回前给出最终分析结果。
-        desc = await analyze_camera_observation(safe_device, image_id, save_path, background_match=False)
-        need_retake = not desc.is_clear or desc.category in ("无法判断", "未知")
-        if need_retake:
-            answer_text = "这张照片信息不太够。请把展品放在画面中间，靠近一点，避开展柜反光后重拍。"
-            response_data = {
-                "ok": True,
-                "analysis_ok": False,
-                "answer_text": answer_text,
-                "len": len(body),
-                "width": width,
-                "height": height,
-                "file": save_path.as_posix(),
-                "device": safe_device,
-                "image_id": image_id,
-                "category": desc.category,
-                "is_clear": desc.is_clear,
-                "confidence": desc.confidence,
-                "visual_description": desc.visual_description,
-                "shape_features": desc.shape_features,
-                "decoration_features": desc.decoration_features,
-                "color_material": desc.color_material,
-                "search_keywords": desc.search_keywords,
-                "risk": desc.risk,
-                "need_retake": True,
-            }
-            return JSONResponse(response_data)
+            desc = await analyze_camera_observation(safe_device, image_id, save_path, background_match=False)
+            if await request.is_disconnected():
+                _mark_camera_upload_failed(safe_device, image_id, generation, "client_disconnected")
+                log(f"[CAMERA] upload failed device={safe_device} image_id={image_id} generation={generation} reason=client_disconnected")
+                return JSONResponse(
+                    {"ok": False, "image_id": image_id, "error": "client disconnected", "message": "client disconnected"},
+                    status_code=499,
+                )
+            if not _is_current_camera_upload(safe_device, image_id, generation):
+                log(f"[CAMERA] stale upload ignored device={safe_device} image_id={image_id} generation={generation} stage=after_vision")
+                return JSONResponse(
+                    {"ok": False, "image_id": image_id, "error": "stale upload", "message": "superseded"},
+                    status_code=409,
+                )
+
+            need_retake = not desc.is_clear or desc.category in ("无法判断", "未知")
+            if need_retake:
+                _mark_camera_upload_failed(safe_device, image_id, generation, "image_not_ready")
+                log(
+                    f"[CAMERA] upload failed device={safe_device} image_id={image_id} generation={generation} "
+                    f"reason=image_not_ready category={desc.category} is_clear={desc.is_clear}"
+                )
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "image_id": image_id,
+                        "error": "image not ready",
+                        "message": "image not ready",
+                        "category": desc.category,
+                        "is_clear": desc.is_clear,
+                        "confidence": desc.confidence,
+                        "need_retake": True,
+                    },
+                    status_code=422,
+                )
+
+            match_start = time.perf_counter()
+            log(f"[CAMERA] visual match start device={safe_device} image_id={image_id} generation={generation}")
+            try:
+                match = await app.state.visual_match.match_async(desc)
+                match_error = ""
+            except Exception as exc:
+                logger.exception("[CAMERA] 本地视觉匹配失败 device=%s image_id=%s", safe_device, image_id)
+                match = VisualMatchResult(evidence=f"匹配异常: {exc}")
+                match_error = str(exc)[:200]
+            log(
+                f"[CAMERA] visual match end device={safe_device} image_id={image_id} generation={generation} "
+                f"match_id={match.match_id} match_name={match.match_name} confidence={match.confidence:.2f} "
+                f"cost={time.perf_counter() - match_start:.3f}s error={match_error}"
+            )
+
+            if await request.is_disconnected():
+                _mark_camera_upload_failed(safe_device, image_id, generation, "client_disconnected")
+                log(f"[CAMERA] upload failed device={safe_device} image_id={image_id} generation={generation} reason=client_disconnected")
+                return JSONResponse(
+                    {"ok": False, "image_id": image_id, "error": "client disconnected", "message": "client disconnected"},
+                    status_code=499,
+                )
+            if not _commit_ready_camera_context(
+                safe_device,
+                image_id,
+                generation,
+                save_path,
+                width=width,
+                height=height,
+                desc=desc,
+                match=match,
+            ):
+                return JSONResponse(
+                    {"ok": False, "image_id": image_id, "error": "stale upload", "message": "superseded"},
+                    status_code=409,
+                )
+
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "status": "ready",
+                    "message": "ready",
+                    "answer_text": "ready",
+                    "analysis_ok": True,
+                    "len": len(body),
+                    "width": width,
+                    "height": height,
+                    "file": save_path.as_posix(),
+                    "device": safe_device,
+                    "image_id": image_id,
+                    "upload_id": image_id,
+                    "generation": generation,
+                    "category": desc.category,
+                    "is_clear": desc.is_clear,
+                    "confidence": desc.confidence,
+                    "visual_description": desc.visual_description,
+                    "shape_features": desc.shape_features,
+                    "decoration_features": desc.decoration_features,
+                    "color_material": desc.color_material,
+                    "search_keywords": desc.search_keywords,
+                    "risk": desc.risk,
+                    "need_retake": False,
+                    "match_id": match.match_id,
+                    "match_name": match.match_name,
+                    "evidence": match.evidence,
+                    "match_confidence": match.confidence,
+                    "match_provider": getattr(match, "provider", ""),
+                    "search_provider": getattr(match, "provider", ""),
+                }
+            )
 
         try:
-            match_start = time.perf_counter()
-            match = await app.state.visual_match.match_async(desc)
-            log(
-                f"[CAMERA] 本地视觉匹配(上传同步) image_id={image_id} "
-                f"match_id={match.match_id} confidence={match.confidence:.2f} "
-                f"cost={time.perf_counter() - match_start:.3f}s"
+            return await asyncio.wait_for(build_ready_response(), timeout=camera_upload_timeout_seconds())
+        except asyncio.TimeoutError:
+            _mark_camera_upload_failed(safe_device, image_id, generation, "timeout")
+            log(f"[CAMERA] upload failed device={safe_device} image_id={image_id} generation={generation} reason=timeout")
+            return JSONResponse(
+                {"ok": False, "image_id": image_id, "error": "upload timeout", "message": "timeout"},
+                status_code=504,
             )
+        except asyncio.CancelledError:
+            _mark_camera_upload_failed(safe_device, image_id, generation, "request_cancelled")
+            log(f"[CAMERA] upload failed device={safe_device} image_id={image_id} generation={generation} reason=request_cancelled")
+            raise
         except Exception as exc:
-            logger.exception("[CAMERA] 本地视觉匹配失败 device=%s image_id=%s", safe_device, image_id)
-            match = VisualMatchResult(evidence=f"匹配异常: {exc}")
+            _mark_camera_upload_failed(safe_device, image_id, generation, str(exc)[:200])
+            logger.exception("[CAMERA] upload failed device=%s image_id=%s", safe_device, image_id)
+            return JSONResponse(
+                {"ok": False, "image_id": image_id, "error": str(exc)[:300], "message": "failed"},
+                status_code=500,
+            )
 
-        cached = app.state.latest_visual_descriptions.get(safe_device)
-        if isinstance(cached, dict) and cached.get("image_id") == image_id:
-            cached["match"] = match
-
-        response_data = {
-            "ok": True,
-            "analysis_ok": True,
-            "answer_text": "图片处理完成，可以提问了。",
-            "len": len(body),
-            "width": width,
-            "height": height,
-            "file": save_path.as_posix(),
-            "device": safe_device,
-            "image_id": image_id,
-            "category": desc.category,
-            "is_clear": desc.is_clear,
-            "confidence": desc.confidence,
-            "visual_description": desc.visual_description,
-            "shape_features": desc.shape_features,
-            "decoration_features": desc.decoration_features,
-            "color_material": desc.color_material,
-            "search_keywords": desc.search_keywords,
-            "risk": desc.risk,
-            "need_retake": False,
-            "match_id": match.match_id,
-            "match_name": match.match_name,
-            "evidence": match.evidence,
-            "match_confidence": match.confidence,
-            "match_provider": getattr(match, "provider", ""),
-            "search_provider": getattr(match, "provider", ""),
-        }
-        return JSONResponse(response_data)
+    @app.post("/camera/cancel")
+    @app.post("/camera/upload/cancel")
+    async def camera_upload_cancel(
+        request: Request,
+        device: str = Query("walkie-01"),
+    ) -> JSONResponse:
+        """Invalidate the current pending camera upload for a device."""
+        body = await request.body()
+        await log_request(request, body, "camera_upload_cancel")
+        safe_device = device or "walkie-01"
+        canceled = _invalidate_camera_upload(safe_device, "device_cancel")
+        log(
+            f"[CAMERA] upload cancel device={safe_device} generation={canceled.get('generation')} "
+            f"reason=device_cancel"
+        )
+        return JSONResponse(
+            {
+                "ok": True,
+                "device": safe_device,
+                "status": "canceled",
+                "message": "canceled",
+                "generation": canceled.get("generation"),
+            }
+        )
 
     @app.post("/camera/analyze_latest")
     async def camera_analyze_latest(
@@ -1102,48 +1322,28 @@ def create_http_app(
         await log_request(request, body, "camera_analyze_latest")
         safe_device = device or "walkie-01"
 
-        # 获取最新图片
-        latest = app.state.latest_images.get(safe_device)
-        if latest is None and safe_device != "walkie-01":
-            latest = app.state.latest_images.get("walkie-01")
-        if latest is None:
+        cached = _get_ready_camera_context(safe_device)
+        if not isinstance(cached, dict):
+            with app.state.camera_upload_lock:
+                latest = app.state.latest_camera_uploads.get(safe_device)
+            status_code = 409 if isinstance(latest, dict) else 404
             return JSONResponse(
-                {"ok": False, "device": safe_device, "error": "no camera image uploaded"},
-                status_code=404,
+                {"ok": False, "device": safe_device, "error": "no ready camera image", "message": "no ready camera image"},
+                status_code=status_code,
             )
 
-        image_path = latest.get("path")
-        if not isinstance(image_path, Path) or not image_path.exists():
+        desc = cached.get("description")
+        match = cached.get("match")
+        image_id = str(cached.get("image_id") or "")
+        if not isinstance(desc, VisualDescription) or not isinstance(match, VisualMatchResult):
             return JSONResponse(
-                {"ok": False, "device": safe_device, "error": "latest image missing"},
-                status_code=404,
+                {"ok": False, "device": safe_device, "image_id": image_id, "error": "camera context incomplete", "message": "camera context incomplete"},
+                status_code=500,
             )
-
-        image_id = str(latest.get("image_id") or image_path.stem)
-
-        # 优先使用缓存的视觉描述 + 本地匹配结果
-        cached = app.state.latest_visual_descriptions.get(safe_device)
-        if (
-            isinstance(cached, dict)
-            and cached.get("image_id") == image_id
-            and isinstance(cached.get("description"), VisualDescription)
-        ):
-            desc = cached["description"]
-            match = cached.get("match") if isinstance(cached.get("match"), VisualMatchResult) else None
-            log(f"[CAMERA] 使用缓存结果 image_id={image_id} has_match={match is not None}")
-        else:
-            desc = await analyze_camera_observation(safe_device, image_id, image_path)
-            match = None
-
-        # 本地视觉匹配：优先用缓存，未完成则同步执行
-        if match is None:
-            match_start = time.perf_counter()
-            match = await app.state.visual_match.match_async(desc)
-            log(
-                f"[CAMERA] 本地视觉匹配(同步) image_id={image_id} "
-                f"match_id={match.match_id} confidence={match.confidence:.2f} "
-                f"cost={time.perf_counter() - match_start:.3f}s"
-            )
+        log(
+            f"[CAMERA] 使用ready缓存结果 image_id={image_id} "
+            f"match_id={match.match_id} confidence={match.confidence:.2f}"
+        )
 
         guide_start = time.perf_counter()
         guide = await app.state.guide_answer_service.build_answer_async(

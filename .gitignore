@@ -42,6 +42,7 @@ pip-wheel-metadata/
 
 # Local review / scratch notes
 PROJECT_REVIEW.md
+work/
 
 # Keep curated test data
 !photo/

@@ -80,10 +80,13 @@ POST /camera/upload?device=walkie-01
 -> 保存 JPEG
 -> VisionService 生成 VisualDescription
 -> VisualMatchService 读取 knowledge/config/vision_profiles.json 做本地匹配
--> 缓存图片、视觉描述、匹配结果
+-> 若仍是该设备最新上传，则一次性缓存 ready 图片上下文
+-> 返回 {"ok": true, "status": "ready", "message": "ready", ...}
 ```
 
-用户随后通过语音问“这是什么”“讲讲这个展品”时，后端直接使用缓存结果和本地文物卡片生成讲解，不重复识别图片。
+`/camera/upload` 不返回 processing/queued；设备端只需要等 HTTP 返回。若上传被新图片取代、取消、超时或照片不可用，会返回非 2xx 或 `ok:false`。可用 `POST /camera/cancel?device=walkie-01` 或 `POST /camera/upload/cancel?device=walkie-01` 让当前 pending 上传失效。
+
+用户随后通过语音问“这是什么”“讲讲这个展品”时，后端只使用当前 latest upload 的 ready 缓存结果和本地文物卡片生成讲解，不重复识别图片，也不会使用半成品图片上下文。
 
 ## 语音问答
 
@@ -98,7 +101,7 @@ POST /ai/result_chunk
 POST /ai/cancel
 ```
 
-普通问题走百炼问答应用。图片相关问题走最近一次 `/camera/upload` 的视觉描述和本地匹配结果。
+普通问题走百炼问答应用。图片相关问题走最近一次 ready 的 `/camera/upload` 视觉描述和本地匹配结果。
 
 ## 工具
 
