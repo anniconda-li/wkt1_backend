@@ -33,6 +33,12 @@ copy .env.example .env
 pip install -r requirements.txt
 ```
 
+Ubuntu 上如果要启用 UDP 对讲 Opus 下行，还需要系统库：
+
+```bash
+sudo apt-get install -y libopus0
+```
+
 `.env` 里至少配置：
 
 ```text
@@ -57,6 +63,22 @@ FFMPEG_BIN=ffmpeg
 ```powershell
 .\.venv\Scripts\python.exe -m server.walkie_app --host 0.0.0.0 --http-port 18080 --udp-port 19000
 ```
+
+只启动 UDP 对讲：
+
+```bash
+./.venv/bin/python -c "from server.udp_server import run_udp; run_udp('0.0.0.0', 19000)"
+```
+
+对讲下行默认兼容旧版 PCM。新设备支持 Opus 后，可在 `.env` 中设置：
+
+```text
+INTERCOM_DOWNLINK_CODEC=opus
+INTERCOM_OPUS_BITRATE=20000
+INTERCOM_OPUS_COMPLEXITY=3
+```
+
+设备上行仍是 `APP_INTERCOM_PKT_AUDIO=4`、16 kHz mono s16le、20 ms、640B payload。服务器在 Opus 模式下只把下行改成 `APP_INTERCOM_PKT_AUDIO_OPUS=7`，payload 是 raw Opus frame。
 
 健康检查：
 
