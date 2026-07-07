@@ -16,11 +16,12 @@ from server.protocol import (
     APP_INTERCOM_PKT_AUDIO,
     PKT_TYPES,
     Packet,
+    HEADER_LEN,
     build_packet,
     parse_packet,
 )
 
-PCM_FRAME_BYTES = 640
+MAX_UDP_PACKET_BYTES = 4096
 DEFAULT_AUDIO_LOG_EVERY_N = 50
 
 
@@ -43,7 +44,7 @@ def run_udp(host: str, port: int, *, log_func=print) -> None:
     audio_log_every = max(_env_int("INTERCOM_AUDIO_LOG_EVERY_N", DEFAULT_AUDIO_LOG_EVERY_N), 0)
 
     while True:
-        data, addr = sock.recvfrom(2048)
+        data, addr = sock.recvfrom(MAX_UDP_PACKET_BYTES)
         packet = parse_packet(data)
         if packet is None:
             log_func(f"UDP 原始数据 from {addr[0]}:{addr[1]} len={len(data)} data={data!r}")
@@ -113,17 +114,18 @@ def build_audio_downlink_packet(
 ) -> bytes | None:
     """Build one downlink audio packet from one upstream PCM packet."""
     pcm_len = len(packet.payload)
-    if pcm_len != PCM_FRAME_BYTES:
-        log_func(
-            f"UDP audio payload_len invalid source={packet.device} ch={packet.channel} "
-            f"pcm_payload_len={pcm_len} expected={PCM_FRAME_BYTES}"
-        )
+    if pcm_len <= 0:
+        log_func(f"UDP audio payload empty source={packet.device} ch={packet.channel}")
+        return None
+    if pcm_len > 0xFFFF:
+        log_func(f"UDP audio payload too large source={packet.device} ch={packet.channel} pcm_payload_len={pcm_len}")
         return None
 
     if log_audio:
         log_func(
             f"UDP audio downlink codec=pcm source={packet.device} ch={packet.channel} "
-            f"pcm_payload_len={pcm_len} downlink_payload_len={pcm_len} target_count={target_count}"
+            f"pcm_payload_len={pcm_len} downlink_payload_len={pcm_len} "
+            f"packet_len={HEADER_LEN + pcm_len} target_count={target_count}"
         )
     return build_packet(
         packet_type=APP_INTERCOM_PKT_AUDIO,

@@ -70,7 +70,7 @@ FFMPEG_BIN=ffmpeg
 INTERCOM_AUDIO_LOG_EVERY_N=50
 ```
 
-设备上行和下行都使用 `APP_INTERCOM_PKT_AUDIO=4`、16 kHz mono s16le、20 ms、640B payload。服务器只转发给同频道其他设备，不回发给发送者本人。
+设备上行和下行都使用 `APP_INTERCOM_PKT_AUDIO=4` PCM 包。服务器不限制单包 payload 长度，会把合法 WTK1 audio payload 原样转发给同频道其他设备，不回发给发送者本人。
 `INTERCOM_AUDIO_LOG_EVERY_N` 用来限制音频热路径日志，默认每路每 50 帧约 1 秒打印一次；设置为 `0` 可关闭音频帧日志，避免日志 I/O 影响 UDP 转发节奏。
 
 健康检查：

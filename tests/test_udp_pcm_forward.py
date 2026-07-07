@@ -16,7 +16,6 @@ from server.protocol import (  # noqa: E402
     parse_packet,
 )
 from server.udp_server import (  # noqa: E402
-    PCM_FRAME_BYTES,
     audio_targets,
     build_audio_downlink_packet,
 )
@@ -79,21 +78,44 @@ class UdpPcmForwardTest(unittest.TestCase):
         self.assertIn("downlink_payload_len=640", logs[-1])
         self.assertIn("target_count=2", logs[-1])
 
-    def test_invalid_pcm_frame_is_dropped(self) -> None:
+    def test_large_pcm_audio_packet_is_forwarded_as_is(self) -> None:
+        pcm = b"\x55\x66" * 640
         packet = Packet(
             packet_type=APP_INTERCOM_PKT_AUDIO,
             channel=1,
             seq=1,
             timestamp_ms=1,
             device="walkie-01",
-            payload=b"\x00" * (PCM_FRAME_BYTES - 1),
+            payload=pcm,
+        )
+        logs: list[str] = []
+
+        out = build_audio_downlink_packet(packet, log_func=logs.append)
+
+        self.assertIsNotNone(out)
+        parsed = parse_packet(out or b"")
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.packet_type, APP_INTERCOM_PKT_AUDIO)
+        self.assertEqual(parsed.payload, pcm)
+        self.assertIn("pcm_payload_len=1280", logs[-1])
+        self.assertIn("downlink_payload_len=1280", logs[-1])
+
+    def test_empty_pcm_audio_packet_is_dropped(self) -> None:
+        packet = Packet(
+            packet_type=APP_INTERCOM_PKT_AUDIO,
+            channel=1,
+            seq=1,
+            timestamp_ms=1,
+            device="walkie-01",
+            payload=b"",
         )
         logs: list[str] = []
 
         out = build_audio_downlink_packet(packet, log_func=logs.append)
 
         self.assertIsNone(out)
-        self.assertIn("payload_len invalid", logs[-1])
+        self.assertIn("payload empty", logs[-1])
 
     def test_audio_targets_exclude_sender_and_other_channels(self) -> None:
         packet = Packet(
@@ -102,7 +124,7 @@ class UdpPcmForwardTest(unittest.TestCase):
             seq=1,
             timestamp_ms=1,
             device="walkie-01",
-            payload=b"\x00" * PCM_FRAME_BYTES,
+            payload=b"\x00" * 640,
         )
         devices = {
             "walkie-01": ("10.0.0.2", 19001, 2),
