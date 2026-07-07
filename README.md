@@ -1,162 +1,121 @@
-# WKT1 AI Guide Backend
+# WKT1 Intercom Backend
 
-ESP32S3 AI 对讲导游设备的本地 FastAPI 后端。
+ESP32 WTK1 设备的 UDP 实时对讲转发服务。
 
-当前主线有三条：
+这个仓库现在只保留对讲链路：
 
 ```text
-1. UDP 实时对讲：设备音频包接收和同设备回传
-2. 语音问答：WAV -> ASR -> 百炼问答应用 -> TTS -> WAV
-3. 图片讲解：JPG -> 视觉描述 -> 本地视觉匹配 -> 本地文物卡片 -> 百炼组织讲解 -> TTS
+ESP32 device A -> WTK1 UDP AUDIO PCM -> server -> paced queue -> ESP32 device B
 ```
 
-视觉识别只负责描述图片可见特征；具体文物判断在本地完成。百炼只保留一个问答应用，用来把本地资料组织成适合语音播报的回答。
+已移除 AI 问答、ASR、TTS、相机上传、视觉识别、知识库和百炼应用相关代码。那些能力由其他项目承接。
 
 ## 目录
 
 ```text
-core/       .env 加载和项目路径
-server/     FastAPI、UDP、协议和媒体解析
-services/   ASR、TTS、百炼、视觉描述、本地视觉匹配、讲解组织
-photo/      文物基准照片
-knowledge/  文物候选配置和视觉档案
-tools/      构建、清理、手工检查脚本
-tests/      自动化测试和测试数据
-tmp/        运行时产物，可清理
+server/     WTK1 协议解析和 UDP 对讲转发
+tests/      UDP 对讲单测
 ```
 
-## 环境
+## 协议
 
-```powershell
-copy .env.example .env
-.\.venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-`.env` 里至少配置：
+保留设备端原有 WTK1 UDP 包格式：
 
 ```text
-DASHSCOPE_API_KEY=...
-BAILIAN_API_KEY=...
-BAILIAN_QA_APP_ID=...
-VISION_PROFILES_PATH=knowledge/config/vision_profiles.json
-EXHIBIT_KNOWLEDGE_PATH=knowledge/config/exhibit_cards.json
-FFMPEG_BIN=ffmpeg
+Byte 0-3:   "WTK1"
+Byte 4:     packet type
+Byte 5:     header length, 固定 34
+Byte 6-7:   channel uint16 little-endian
+Byte 8-11:  seq uint32 little-endian
+Byte 12-15: timestamp uint32 little-endian ms
+Byte 16-31: device name, 16 bytes, zero padded
+Byte 32-33: payload length uint16 little-endian
+Byte 34+:   payload
+```
+
+包类型：
+
+```text
+1 REGISTER
+2 CHANNEL
+3 PTT_START
+4 AUDIO
+5 PTT_STOP
+6 HEARTBEAT
+```
+
+`AUDIO` payload 保持设备端 PCM 原格式：PCM s16le / 16kHz / mono。服务端不改 packet type、header、seq、timestamp、device 字段或 payload 内容。
+
+## 安装
+
+```bash
+python -m venv .venv
+cp .env.example .env
+```
+
+Windows PowerShell：
+
+```powershell
+py -m venv .venv
+copy .env.example .env
 ```
 
 ## 启动
 
-只启动 HTTP：
-
-```powershell
-.\.venv\Scripts\python.exe -m uvicorn main:app --host 0.0.0.0 --port 18080
-```
-
-启动 HTTP + UDP：
-
-```powershell
-.\.venv\Scripts\python.exe -m server.walkie_app --host 0.0.0.0 --http-port 18080 --udp-port 19000
-```
-
-只启动 UDP 对讲：
+Ubuntu / Linux：
 
 ```bash
-./.venv/bin/python -c "from server.udp_server import run_udp; run_udp('0.0.0.0', 19000)"
+./.venv/bin/python -m server.udp_server --host 0.0.0.0 --udp-port 19000
 ```
 
-对讲服务只转发 PCM 音频包，不改设备端 WTK1 header、packet type、seq 或 payload。服务端收到同频道音频后，会先放入目标设备的下行队列，再按固定节奏发给接收端，用一点延迟换取更稳定的播放。
+Windows PowerShell：
+
+```powershell
+.\.venv\Scripts\python.exe -m server.udp_server --host 0.0.0.0 --udp-port 19000
+```
+
+也可以用主入口：
+
+```bash
+python main.py --host 0.0.0.0 --udp-port 19000
+```
+
+启动后会看到类似日志：
 
 ```text
-INTERCOM_AUDIO_LOG_EVERY_N=50
+UDP WTK1 监听 0.0.0.0:19000
+UDP downlink codec=pcm mode=paced ...
+```
+
+## 下行队列
+
+服务端收到同频道设备的 `AUDIO` 包后，不直接突发 `sendto`，而是放入目标设备的 per-target 队列，再按固定节奏下发：
+
+```text
 INTERCOM_PACING_INTERVAL_MS=20
 INTERCOM_PREBUFFER_PACKETS=20
 INTERCOM_PREBUFFER_IDLE_FLUSH_MS=120
 INTERCOM_QUEUE_MAX_PACKETS=80
 INTERCOM_QUEUE_HIGH_WATER=60
+INTERCOM_AUDIO_LOG_EVERY_N=50
 ```
 
-设备上行和下行都使用 `APP_INTERCOM_PKT_AUDIO=4` PCM 包。服务器不限制单包 payload 长度，会把合法 WTK1 audio payload 原样转发给同频道其他设备，不回发给发送者本人。
-`INTERCOM_PACING_INTERVAL_MS` 默认 20ms，每个目标队列一次只发 1 个音频包。`INTERCOM_PREBUFFER_PACKETS` 默认 20 包，约 400ms 后起播；短语音如果没攒够预缓冲，会在 PTT_STOP 或 `INTERCOM_PREBUFFER_IDLE_FLUSH_MS` 空闲超时后按节奏发完。`INTERCOM_QUEUE_MAX_PACKETS` 防止延迟无限增长，超过后丢最旧音频包；`INTERCOM_QUEUE_HIGH_WATER` 只用于日志告警。`INTERCOM_AUDIO_LOG_EVERY_N` 用来限制音频热路径日志，默认每路每 50 帧约 1 秒打印一次；设置为 `0` 可关闭音频帧日志，避免日志 I/O 影响 UDP 转发节奏。
+默认含义：
 
-健康检查：
+- `INTERCOM_PACING_INTERVAL_MS=20`：每 20ms 发 1 个完整 WTK1 AUDIO 包。
+- `INTERCOM_PREBUFFER_PACKETS=20`：新语音流先攒约 400ms 再起播。
+- `INTERCOM_PREBUFFER_IDLE_FLUSH_MS=120`：短语音没攒够预缓冲时，空闲 120ms 后也会按节奏发完。
+- `INTERCOM_QUEUE_MAX_PACKETS=80`：队列最多约 1.6s 音频，超过后丢最旧包，避免延迟无限增长。
+- `INTERCOM_QUEUE_HIGH_WATER=60`：队列达到高水位时打印告警。
+- `INTERCOM_AUDIO_LOG_EVERY_N=50`：音频热路径日志限频；设为 `0` 可关闭音频帧日志。
 
-```text
-GET /healthz
-GET /readyz
-```
-
-## 图片讲解
-
-基准数据准备：
-
-```powershell
-python tools\build_vision_profiles.py --overwrite
-```
-
-运行时流程：
-
-```text
-POST /camera/upload?device=walkie-01
--> 保存 JPEG
--> VisionService 生成 VisualDescription
--> VisualMatchService 读取 knowledge/config/vision_profiles.json 做本地匹配
--> 若仍是该设备最新上传，则一次性缓存 ready 图片上下文
--> 返回 {"ok": true, "status": "ready", "message": "ready", ...}
-```
-
-`/camera/upload` 不返回 processing/queued；设备端只需要等 HTTP 返回。若上传被新图片取代、取消、超时或照片不可用，会返回非 2xx 或 `ok:false`。可用 `POST /camera/cancel?device=walkie-01` 或 `POST /camera/upload/cancel?device=walkie-01` 让当前 pending 上传失效。
-
-用户随后通过语音问“这是什么”“讲讲这个展品”时，后端只使用当前 latest upload 的 ready 缓存结果和本地文物卡片生成讲解，不重复识别图片，也不会使用半成品图片上下文。
-
-## 语音问答
-
-设备语音链路：
-
-```text
-POST /ai/start
-POST /ai/upload
-POST /ai/finish
-POST /ai/result_info
-POST /ai/result_chunk
-POST /ai/cancel
-```
-
-普通问题走百炼问答应用。图片相关问题走最近一次 ready 的 `/camera/upload` 视觉描述和本地匹配结果。
-
-## 工具
-
-```powershell
-python tools\build_vision_profiles.py --overwrite
-python tools\check_artifact_pipeline.py --image tests\data\camera\yingguo_yuying.jpg --no-bailian
-python tools\check_camera_guide.py --image tests\data\camera\yingguo_yuying.jpg --no-bailian
-python tools\check_audio_loop.py --mock-bailian
-python tools\check_bailian_app.py
-python tools\check_http_client_e2e.py --base-url http://127.0.0.1:18080
-python tools\check_device_client.py --base-url http://127.0.0.1:18080 --server
-python tools\clean_tmp.py
-```
-
-`tools/check_*` 是人工验收工具；自动化测试放在 `tests/`。
+控制包仍用于维护设备状态；服务端只转发给同频道其他设备，不回发给发送者本人。
 
 ## 测试
 
-```powershell
-.\.venv\Scripts\python.exe -m compileall core server services tools tests
-.\.venv\Scripts\python.exe tests\test_ai_cancel.py
+```bash
+python -m compileall server tests
+python -m unittest tests.test_udp_pcm_forward
 ```
 
-## 数据约定
-
-```text
-photo/                                      基准照片
-knowledge/config/museum_vision_candidates.json  文物候选、基础信息、讲解资料、基准图路径
-knowledge/config/vision_profiles.json           视觉模型生成的基准视觉档案
-knowledge/config/exhibit_cards.json             可选覆盖文件；不存在时从候选配置生成卡片
-tests/data/camera/                              长期保留的测试图片
-tmp/camera/received/                            设备上传原图
-tmp/camera/preprocess/                          视觉预处理图
-tmp/audio/                                      音频运行产物
-tmp/debug/                                      调试输出
-```
-
-不要提交 `.env` 或真实 API Key。`tmp/` 是运行时目录，长期保留的数据放到 `photo/`、`knowledge/` 或 `tests/data/`。
+不要提交 `.env`。公网服务器需要放行 UDP `19000` 入站端口。

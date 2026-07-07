@@ -1,21 +1,16 @@
-"""WTK1 UDP server loop.
-
-The UDP side is independent from FastAPI: it receives device packets, records
-basic traffic, forwards audio between devices on the same channel, and echoes
-single-device audio for local tests. Keeping it separate lets the HTTP app stay
-focused on API state and request handling.
-"""
+"""WTK1 UDP intercom server loop."""
 
 from __future__ import annotations
 
+import argparse
 import os
 import socket
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 
-import core.config  # noqa: F401 - load project .env when UDP is started standalone
 from server.protocol import (
     APP_INTERCOM_PKT_AUDIO,
     APP_INTERCOM_PKT_PTT_START,
@@ -34,6 +29,25 @@ DEFAULT_PREBUFFER_PACKETS = 20
 DEFAULT_PREBUFFER_IDLE_FLUSH_MS = 120
 DEFAULT_QUEUE_MAX_PACKETS = 80
 DEFAULT_QUEUE_HIGH_WATER = 60
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_env_file(path: Path) -> None:
+    """Load simple KEY=VALUE pairs without requiring third-party packages."""
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_env_file(PROJECT_ROOT / ".env")
 
 
 @dataclass(frozen=True)
@@ -346,3 +360,26 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+def _env_str(name: str, default: str) -> str:
+    return os.getenv(name, default).strip() or default
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Run the WTK1 UDP intercom forwarding service.")
+    parser.add_argument("--host", default=_env_str("INTERCOM_HOST", "0.0.0.0"), help="UDP bind host")
+    parser.add_argument(
+        "--udp-port",
+        "--port",
+        dest="udp_port",
+        type=int,
+        default=_env_int("INTERCOM_UDP_PORT", 19000),
+        help="UDP bind port",
+    )
+    args = parser.parse_args(argv)
+    run_udp(args.host, args.udp_port)
+
+
+if __name__ == "__main__":
+    main()

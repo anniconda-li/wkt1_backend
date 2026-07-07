@@ -1,9 +1,4 @@
-"""WTK1 UDP protocol helpers.
-
-This module keeps packet parsing and echo packet construction out of the
-FastAPI application layer. The protocol is binary and fixed-width, so keeping it
-isolated makes route and server code easier to reason about.
-"""
+"""WTK1 UDP protocol helpers."""
 
 from __future__ import annotations
 
@@ -12,7 +7,6 @@ from dataclasses import dataclass
 MAGIC = b"WTK1"
 HEADER_LEN = 34
 DEVICE_LEN = 16
-SERVER_DEVICE = b"server-echo"
 
 APP_INTERCOM_PKT_REGISTER = 1
 APP_INTERCOM_PKT_CHANNEL = 2
@@ -122,11 +116,3 @@ def parse_packet(data: bytes) -> Packet | None:
         device=device_raw.decode("utf-8", errors="replace"),
         payload=data[header_len : header_len + payload_len],
     )
-
-
-def make_server_echo(data: bytes) -> bytes:
-    """Return an echo packet with the device field replaced by the server id."""
-    out = bytearray(data)
-    out[16:32] = b"\x00" * DEVICE_LEN
-    out[16 : 16 + len(SERVER_DEVICE)] = SERVER_DEVICE
-    return bytes(out)

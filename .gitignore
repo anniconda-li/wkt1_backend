@@ -15,6 +15,7 @@ htmlcov/
 venv/
 env/
 ENV/
+.agents/
 .env
 .env.*
 !.env.example
@@ -43,24 +44,6 @@ pip-wheel-metadata/
 # Local review / scratch notes
 PROJECT_REVIEW.md
 work/
-
-# Keep curated test data
-!photo/
-!photo/*.jpg
-!photo/*.jpeg
-!photo/*.png
-!tests/
-!tests/data/
-!tests/data/received_wav/
-!tests/data/received_wav/*.wav
-!tests/data/received_jpg/
-!tests/data/received_jpg/*.jpg
-!tests/data/received_jpg/*.jpeg
-!tests/data/received_jpg/*.png
-!tests/data/camera/
-!tests/data/camera/*.jpg
-!tests/data/camera/*.jpeg
-!tests/data/camera/*.png
 
 # Local editor and OS files
 .idea/
