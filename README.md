@@ -64,14 +64,19 @@ FFMPEG_BIN=ffmpeg
 ./.venv/bin/python -c "from server.udp_server import run_udp; run_udp('0.0.0.0', 19000)"
 ```
 
-对讲服务只转发 PCM 音频包。可在 `.env` 中设置音频热路径日志限频：
+对讲服务只转发 PCM 音频包，不改设备端 WTK1 header、packet type、seq 或 payload。服务端收到同频道音频后，会先放入目标设备的下行队列，再按固定节奏发给接收端，用一点延迟换取更稳定的播放。
 
 ```text
 INTERCOM_AUDIO_LOG_EVERY_N=50
+INTERCOM_PACING_INTERVAL_MS=20
+INTERCOM_PREBUFFER_PACKETS=20
+INTERCOM_PREBUFFER_IDLE_FLUSH_MS=120
+INTERCOM_QUEUE_MAX_PACKETS=80
+INTERCOM_QUEUE_HIGH_WATER=60
 ```
 
 设备上行和下行都使用 `APP_INTERCOM_PKT_AUDIO=4` PCM 包。服务器不限制单包 payload 长度，会把合法 WTK1 audio payload 原样转发给同频道其他设备，不回发给发送者本人。
-`INTERCOM_AUDIO_LOG_EVERY_N` 用来限制音频热路径日志，默认每路每 50 帧约 1 秒打印一次；设置为 `0` 可关闭音频帧日志，避免日志 I/O 影响 UDP 转发节奏。
+`INTERCOM_PACING_INTERVAL_MS` 默认 20ms，每个目标队列一次只发 1 个音频包。`INTERCOM_PREBUFFER_PACKETS` 默认 20 包，约 400ms 后起播；短语音如果没攒够预缓冲，会在 PTT_STOP 或 `INTERCOM_PREBUFFER_IDLE_FLUSH_MS` 空闲超时后按节奏发完。`INTERCOM_QUEUE_MAX_PACKETS` 防止延迟无限增长，超过后丢最旧音频包；`INTERCOM_QUEUE_HIGH_WATER` 只用于日志告警。`INTERCOM_AUDIO_LOG_EVERY_N` 用来限制音频热路径日志，默认每路每 50 帧约 1 秒打印一次；设置为 `0` 可关闭音频帧日志，避免日志 I/O 影响 UDP 转发节奏。
 
 健康检查：
 
