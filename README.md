@@ -33,12 +33,6 @@ copy .env.example .env
 pip install -r requirements.txt
 ```
 
-Ubuntu 上如果要启用 UDP 对讲 Opus 下行，还需要系统库：
-
-```bash
-sudo apt-get install -y libopus0
-```
-
 `.env` 里至少配置：
 
 ```text
@@ -70,16 +64,13 @@ FFMPEG_BIN=ffmpeg
 ./.venv/bin/python -c "from server.udp_server import run_udp; run_udp('0.0.0.0', 19000)"
 ```
 
-对讲下行默认兼容旧版 PCM。新设备支持 Opus 后，可在 `.env` 中设置：
+对讲服务只转发 PCM 音频包。可在 `.env` 中设置音频热路径日志限频：
 
 ```text
-INTERCOM_DOWNLINK_CODEC=opus
-INTERCOM_OPUS_BITRATE=20000
-INTERCOM_OPUS_COMPLEXITY=3
 INTERCOM_AUDIO_LOG_EVERY_N=50
 ```
 
-设备上行仍是 `APP_INTERCOM_PKT_AUDIO=4`、16 kHz mono s16le、20 ms、640B payload。服务器在 Opus 模式下只把下行改成 `APP_INTERCOM_PKT_AUDIO_OPUS=7`，payload 是 raw Opus frame。
+设备上行和下行都使用 `APP_INTERCOM_PKT_AUDIO=4`、16 kHz mono s16le、20 ms、640B payload。服务器只转发给同频道其他设备，不回发给发送者本人。
 `INTERCOM_AUDIO_LOG_EVERY_N` 用来限制音频热路径日志，默认每路每 50 帧约 1 秒打印一次；设置为 `0` 可关闭音频帧日志，避免日志 I/O 影响 UDP 转发节奏。
 
 健康检查：

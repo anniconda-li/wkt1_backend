@@ -5,4 +5,3 @@ httpx
 python-dotenv
 dashscope
 pillow
-opuslib

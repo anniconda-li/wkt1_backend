@@ -1,4 +1,4 @@
-"""UDP intercom Opus downlink tests."""
+"""UDP intercom PCM forwarding tests."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from server.protocol import (  # noqa: E402
     APP_INTERCOM_PKT_AUDIO,
-    APP_INTERCOM_PKT_AUDIO_OPUS,
     HEADER_LEN,
     Packet,
     build_packet,
@@ -23,25 +22,16 @@ from server.udp_server import (  # noqa: E402
 )
 
 
-class FakeOpusEncoder:
-    def __init__(self, output: bytes = b"\x11\x22\x33") -> None:
-        self.output = output
-        self.calls: list[bytes] = []
-
-    def encode(self, pcm_frame: bytes) -> bytes:
-        self.calls.append(pcm_frame)
-        return self.output
-
-
-class UdpOpusDownlinkTest(unittest.TestCase):
-    def test_build_packet_round_trips_audio_opus(self) -> None:
+class UdpPcmForwardTest(unittest.TestCase):
+    def test_build_packet_round_trips_audio_pcm(self) -> None:
+        pcm = b"\x00\x00" * 320
         data = build_packet(
-            packet_type=APP_INTERCOM_PKT_AUDIO_OPUS,
+            packet_type=APP_INTERCOM_PKT_AUDIO,
             channel=3,
             seq=42,
             timestamp_ms=123456,
             device="walkie-01",
-            payload=b"opus-frame",
+            payload=pcm,
         )
 
         packet = parse_packet(data)
@@ -49,14 +39,14 @@ class UdpOpusDownlinkTest(unittest.TestCase):
         self.assertIsNotNone(packet)
         assert packet is not None
         self.assertEqual(data[5], HEADER_LEN)
-        self.assertEqual(packet.packet_type, APP_INTERCOM_PKT_AUDIO_OPUS)
+        self.assertEqual(packet.packet_type, APP_INTERCOM_PKT_AUDIO)
         self.assertEqual(packet.channel, 3)
         self.assertEqual(packet.seq, 42)
         self.assertEqual(packet.timestamp_ms, 123456)
         self.assertEqual(packet.device, "walkie-01")
-        self.assertEqual(packet.payload, b"opus-frame")
+        self.assertEqual(packet.payload, pcm)
 
-    def test_pcm_audio_packet_becomes_raw_opus_downlink_packet(self) -> None:
+    def test_pcm_audio_packet_stays_pcm_downlink_packet(self) -> None:
         pcm = b"\x00\x00" * 320
         packet = Packet(
             packet_type=APP_INTERCOM_PKT_AUDIO,
@@ -66,33 +56,30 @@ class UdpOpusDownlinkTest(unittest.TestCase):
             device="walkie-01",
             payload=pcm,
         )
-        encoder = FakeOpusEncoder(b"\x01\x02\x03\x04")
         logs: list[str] = []
 
         out = build_audio_downlink_packet(
             packet,
-            codec="opus",
-            opus_encoder=encoder,
             target_count=2,
             log_func=logs.append,
         )
 
-        self.assertEqual(encoder.calls, [pcm])
         self.assertIsNotNone(out)
         parsed = parse_packet(out or b"")
         self.assertIsNotNone(parsed)
         assert parsed is not None
-        self.assertEqual(parsed.packet_type, APP_INTERCOM_PKT_AUDIO_OPUS)
+        self.assertEqual(parsed.packet_type, APP_INTERCOM_PKT_AUDIO)
         self.assertEqual(parsed.channel, packet.channel)
         self.assertEqual(parsed.seq, packet.seq)
         self.assertEqual(parsed.timestamp_ms, packet.timestamp_ms)
         self.assertEqual(parsed.device, packet.device)
-        self.assertEqual(parsed.payload, b"\x01\x02\x03\x04")
+        self.assertEqual(parsed.payload, pcm)
+        self.assertIn("codec=pcm", logs[-1])
         self.assertIn("pcm_payload_len=640", logs[-1])
-        self.assertIn("downlink_payload_len=4", logs[-1])
+        self.assertIn("downlink_payload_len=640", logs[-1])
         self.assertIn("target_count=2", logs[-1])
 
-    def test_invalid_pcm_frame_is_dropped_before_encoding(self) -> None:
+    def test_invalid_pcm_frame_is_dropped(self) -> None:
         packet = Packet(
             packet_type=APP_INTERCOM_PKT_AUDIO,
             channel=1,
@@ -101,18 +88,11 @@ class UdpOpusDownlinkTest(unittest.TestCase):
             device="walkie-01",
             payload=b"\x00" * (PCM_FRAME_BYTES - 1),
         )
-        encoder = FakeOpusEncoder()
         logs: list[str] = []
 
-        out = build_audio_downlink_packet(
-            packet,
-            codec="opus",
-            opus_encoder=encoder,
-            log_func=logs.append,
-        )
+        out = build_audio_downlink_packet(packet, log_func=logs.append)
 
         self.assertIsNone(out)
-        self.assertEqual(encoder.calls, [])
         self.assertIn("payload_len invalid", logs[-1])
 
     def test_audio_targets_exclude_sender_and_other_channels(self) -> None:

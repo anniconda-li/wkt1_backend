@@ -10,13 +10,10 @@ from __future__ import annotations
 
 import os
 import socket
-import time
-from typing import Protocol
 
 import core.config  # noqa: F401 - load project .env when UDP is started standalone
 from server.protocol import (
     APP_INTERCOM_PKT_AUDIO,
-    APP_INTERCOM_PKT_AUDIO_OPUS,
     PKT_TYPES,
     Packet,
     build_packet,
@@ -24,70 +21,11 @@ from server.protocol import (
 )
 
 PCM_FRAME_BYTES = 640
-PCM_FRAME_SAMPLES = 320
-OPUS_SAMPLE_RATE = 16000
-OPUS_CHANNELS = 1
-DEFAULT_OPUS_BITRATE = 20000
-DEFAULT_OPUS_COMPLEXITY = 3
 DEFAULT_AUDIO_LOG_EVERY_N = 50
-DOWNLINK_CODECS = {"pcm", "opus"}
-
-
-class AudioEncoder(Protocol):
-    """Minimal interface used by the UDP loop and tests."""
-
-    def encode(self, pcm_frame: bytes) -> bytes:
-        ...
-
-
-class OpusDownlinkEncoder:
-    """Encode one 16 kHz mono 20 ms PCM frame into one raw Opus frame."""
-
-    def __init__(
-        self,
-        *,
-        sample_rate: int = OPUS_SAMPLE_RATE,
-        channels: int = OPUS_CHANNELS,
-        frame_samples: int = PCM_FRAME_SAMPLES,
-        bitrate: int = DEFAULT_OPUS_BITRATE,
-        complexity: int = DEFAULT_OPUS_COMPLEXITY,
-    ) -> None:
-        try:
-            import opuslib
-        except Exception as exc:  # pragma: no cover - depends on deployment libs
-            raise RuntimeError("opuslib is not installed or libopus is unavailable") from exc
-
-        application = getattr(opuslib, "APPLICATION_VOIP", "voip")
-        self._encoder = opuslib.Encoder(sample_rate, channels, application)
-        self._frame_samples = frame_samples
-        try:
-            self._encoder.bitrate = bitrate
-        except Exception:
-            pass
-        try:
-            self._encoder.complexity = max(0, min(int(complexity), 10))
-        except Exception:
-            pass
-
-    def encode(self, pcm_frame: bytes) -> bytes:
-        return self._encoder.encode(pcm_frame, self._frame_samples)
 
 
 def run_udp(host: str, port: int, *, log_func=print) -> None:
     """Run the blocking WTK1 UDP loop."""
-    configured_codec = os.getenv("INTERCOM_DOWNLINK_CODEC", "pcm").strip().lower() or "pcm"
-    codec = downlink_codec_from_env()
-    opus_encoder: AudioEncoder | None = None
-    if codec == "opus":
-        try:
-            opus_encoder = OpusDownlinkEncoder(
-                bitrate=_env_int("INTERCOM_OPUS_BITRATE", DEFAULT_OPUS_BITRATE),
-                complexity=_env_int("INTERCOM_OPUS_COMPLEXITY", DEFAULT_OPUS_COMPLEXITY),
-            )
-        except Exception as exc:
-            log_func(f"UDP Opus 编码器不可用，降级 PCM: {exc}")
-            codec = "pcm"
-
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.bind((host, port))
@@ -96,9 +34,7 @@ def run_udp(host: str, port: int, *, log_func=print) -> None:
         return
     log_func(f"UDP WTK1 监听 {host}:{port}")
     log_func(
-        f"UDP downlink codec configured={configured_codec} effective={codec} "
-        f"opus_bitrate={_env_int('INTERCOM_OPUS_BITRATE', DEFAULT_OPUS_BITRATE)} "
-        f"opus_complexity={_env_int('INTERCOM_OPUS_COMPLEXITY', DEFAULT_OPUS_COMPLEXITY)} "
+        "UDP downlink codec=pcm "
         f"audio_log_every={_env_int('INTERCOM_AUDIO_LOG_EVERY_N', DEFAULT_AUDIO_LOG_EVERY_N)}"
     )
 
@@ -138,8 +74,6 @@ def run_udp(host: str, port: int, *, log_func=print) -> None:
                 continue
             downlink = build_audio_downlink_packet(
                 packet,
-                codec=codec,
-                opus_encoder=opus_encoder,
                 target_count=len(targets),
                 log_audio=should_log_audio,
                 log_func=log_func,
@@ -155,14 +89,6 @@ def run_udp(host: str, port: int, *, log_func=print) -> None:
                         f"UDP 音频转发至 {dev}@{dev_addr[0]}:{dev_addr[1]} "
                         f"type={PKT_TYPES.get(packet_type, packet_type)} payload={payload_len}"
                     )
-
-
-def downlink_codec_from_env() -> str:
-    """Return configured server-to-device audio codec."""
-    codec = os.getenv("INTERCOM_DOWNLINK_CODEC", "pcm").strip().lower()
-    if codec not in DOWNLINK_CODECS:
-        return "pcm"
-    return codec
 
 
 def audio_targets(
@@ -181,8 +107,6 @@ def audio_targets(
 def build_audio_downlink_packet(
     packet: Packet,
     *,
-    codec: str,
-    opus_encoder: AudioEncoder | None,
     target_count: int = 0,
     log_audio: bool = True,
     log_func=print,
@@ -196,41 +120,18 @@ def build_audio_downlink_packet(
         )
         return None
 
-    packet_type = APP_INTERCOM_PKT_AUDIO
-    payload = packet.payload
-    encode_cost = 0.0
-    actual_codec = "pcm"
-
-    if codec == "opus":
-        if opus_encoder is None:
-            log_func(f"UDP Opus 编码器未初始化，降级 PCM source={packet.device} ch={packet.channel}")
-        else:
-            encode_start = time.perf_counter()
-            try:
-                payload = opus_encoder.encode(packet.payload)
-                packet_type = APP_INTERCOM_PKT_AUDIO_OPUS
-                actual_codec = "opus"
-            except Exception as exc:
-                log_func(f"UDP Opus 编码失败，降级 PCM source={packet.device} ch={packet.channel} error={exc}")
-                payload = packet.payload
-                packet_type = APP_INTERCOM_PKT_AUDIO
-                actual_codec = "pcm"
-            encode_cost = time.perf_counter() - encode_start
-
     if log_audio:
         log_func(
-            f"UDP audio downlink codec={actual_codec} source={packet.device} ch={packet.channel} "
-            f"pcm_payload_len={pcm_len} downlink_payload_len={len(payload)} "
-            f"opus_payload_len={len(payload) if actual_codec == 'opus' else 0} "
-            f"encode_ms={encode_cost * 1000:.2f} target_count={target_count}"
+            f"UDP audio downlink codec=pcm source={packet.device} ch={packet.channel} "
+            f"pcm_payload_len={pcm_len} downlink_payload_len={pcm_len} target_count={target_count}"
         )
     return build_packet(
-        packet_type=packet_type,
+        packet_type=APP_INTERCOM_PKT_AUDIO,
         channel=packet.channel,
         seq=packet.seq,
         timestamp_ms=packet.timestamp_ms,
         device=packet.device,
-        payload=payload,
+        payload=packet.payload,
     )
 
 
