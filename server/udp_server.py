@@ -13,13 +13,16 @@ from pathlib import Path
 
 from server.protocol import (
     APP_INTERCOM_PKT_AUDIO,
+    APP_INTERCOM_PKT_AUDIO_FEC,
     APP_INTERCOM_PKT_NACK,
     APP_INTERCOM_PKT_PTT_START,
     APP_INTERCOM_PKT_PTT_STOP,
     PKT_TYPES,
     Packet,
     HEADER_LEN,
+    build_fec_payload,
     build_packet,
+    parse_fec_payload,
     parse_nack_payload,
     parse_packet,
 )
@@ -34,6 +37,7 @@ DEFAULT_QUEUE_HIGH_WATER = 60
 DEFAULT_NACK_CACHE_PACKETS = 200
 DEFAULT_NACK_CACHE_SECONDS = 3.0
 DEFAULT_NACK_MAX_COUNT = 16
+DEFAULT_FEC_GROUP_SIZE = 4
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -206,7 +210,7 @@ class DownlinkQueue:
             self._source_stopped = True
             self._condition.notify_all()
 
-    def enqueue_audio(self, packet_bytes: bytes) -> None:
+    def enqueue_packet(self, packet_bytes: bytes) -> None:
         with self._condition:
             if len(self._queue) >= self.max_packets:
                 self._queue.popleft()
@@ -223,6 +227,9 @@ class DownlinkQueue:
                     f"ch={self.key.channel} queue_len={queue_len} drop_count={drop_count}"
                 )
             self._condition.notify_all()
+
+    def enqueue_audio(self, packet_bytes: bytes) -> None:
+        self.enqueue_packet(packet_bytes)
 
     def queue_len(self) -> int:
         with self._condition:
@@ -255,6 +262,7 @@ class DownlinkQueue:
                     target_addr = self.target_addr
                     queue_len = len(self._queue)
                     drop_count = self.drop_count
+                    packet = parse_packet(packet_bytes)
 
                 now = time.monotonic()
                 if now < next_send:
@@ -270,29 +278,119 @@ class DownlinkQueue:
                         f"ch={self.key.channel} error={exc}"
                     )
                 else:
-                    if self.packet_cache is not None:
-                        packet = parse_packet(packet_bytes)
-                        if packet is not None:
-                            self.packet_cache.put(
-                                target_device=self.key.target_device,
-                                source_device=self.key.source_device,
-                                channel=self.key.channel,
-                                seq=packet.seq,
-                                timestamp_ms=packet.timestamp_ms,
-                                packet_bytes=packet_bytes,
-                            )
+                    if self.packet_cache is not None and packet is not None and packet.packet_type == APP_INTERCOM_PKT_AUDIO:
+                        self.packet_cache.put(
+                            target_device=self.key.target_device,
+                            source_device=self.key.source_device,
+                            channel=self.key.channel,
+                            seq=packet.seq,
+                            timestamp_ms=packet.timestamp_ms,
+                            packet_bytes=packet_bytes,
+                        )
 
                 self.sent_count += 1
                 if self.log_every > 0 and self.sent_count % self.log_every == 0:
-                    self.log_func(
-                        f"UDP paced send target={self.key.target_device} source={self.key.source_device} "
-                        f"ch={self.key.channel} queue_len={queue_len} drop_count={drop_count} "
-                        f"send_interval_ms={self.interval_s * 1000:.1f} pacing_lag_ms={pacing_lag * 1000:.2f}"
-                    )
+                    packet_type = PKT_TYPES.get(packet.packet_type, packet.packet_type) if packet is not None else "unknown"
+                    if packet is not None and packet.packet_type == APP_INTERCOM_PKT_AUDIO_FEC:
+                        fec = parse_fec_payload(packet.payload)
+                        base = fec.base_seq if fec is not None else packet.seq
+                        self.log_func(
+                            f"UDP paced send target={self.key.target_device} source={self.key.source_device} "
+                            f"ch={self.key.channel} type={packet_type} base={base} "
+                            f"queue_len={queue_len} drop_count={drop_count} "
+                            f"send_interval_ms={self.interval_s * 1000:.1f} pacing_lag_ms={pacing_lag * 1000:.2f}"
+                        )
+                    else:
+                        self.log_func(
+                            f"UDP paced send target={self.key.target_device} source={self.key.source_device} "
+                            f"ch={self.key.channel} type={packet_type} queue_len={queue_len} drop_count={drop_count} "
+                            f"send_interval_ms={self.interval_s * 1000:.1f} pacing_lag_ms={pacing_lag * 1000:.2f}"
+                        )
 
                 next_send += self.interval_s
                 if next_send < now - self.interval_s:
                     next_send = now + self.interval_s
+
+
+class FecGroupBuilder:
+    """Build XOR AUDIO_FEC packets from contiguous downlink AUDIO groups."""
+
+    def __init__(self, *, group_size: int, log_func=print, log_every: int = 0) -> None:
+        self.group_size = max(group_size, 2)
+        self.log_func = log_func
+        self.log_every = max(log_every, 0)
+        self._groups: dict[DownlinkKey, list[Packet]] = {}
+        self._generated_counts: dict[DownlinkKey, int] = {}
+
+    def reset(self, key: DownlinkKey) -> None:
+        self._groups.pop(key, None)
+
+    def reset_source(self, *, source_device: str, channel: int) -> None:
+        for key in list(self._groups):
+            if key.source_device == source_device and key.channel == channel:
+                self._groups.pop(key, None)
+
+    def add_audio(self, key: DownlinkKey, packet: Packet) -> bytes | None:
+        if packet.packet_type != APP_INTERCOM_PKT_AUDIO or not packet.payload:
+            return None
+
+        group = self._groups.setdefault(key, [])
+        if group:
+            expected_seq = (group[-1].seq + 1) & 0xFFFFFFFF
+            if packet.seq != expected_seq:
+                self.log_func(
+                    f"UDP fec skip source={key.source_device} ch={key.channel} "
+                    f"reason=non_contiguous expected={expected_seq} got={packet.seq}"
+                )
+                self._groups[key] = [packet]
+                return None
+            expected_payload_len = len(group[0].payload)
+            if len(packet.payload) != expected_payload_len:
+                self.log_func(
+                    f"UDP fec skip source={key.source_device} ch={key.channel} "
+                    f"reason=payload_len_mismatch expected={expected_payload_len} got={len(packet.payload)}"
+                )
+                self._groups[key] = [packet]
+                return None
+
+        group.append(packet)
+        if len(group) < self.group_size:
+            return None
+
+        fec_packet = self._build_fec_packet(group)
+        self._groups[key] = []
+        generated_count = self._generated_counts.get(key, 0) + 1
+        self._generated_counts[key] = generated_count
+        if self.log_every > 0 and (generated_count == 1 or generated_count % self.log_every == 0):
+            base_seq = group[0].seq
+            payload_len = len(group[0].payload)
+            self.log_func(
+                f"UDP fec enqueue target={key.target_device} source={key.source_device} "
+                f"ch={key.channel} base={base_seq} count={len(group)} payload={payload_len}"
+            )
+        return fec_packet
+
+    def _build_fec_packet(self, group: list[Packet]) -> bytes:
+        base = group[0]
+        xor_payload = bytearray(base.payload)
+        for packet in group[1:]:
+            for index, value in enumerate(packet.payload):
+                xor_payload[index] ^= value
+        fec_payload = build_fec_payload(
+            base_seq=base.seq,
+            count=len(group),
+            payload_len=len(xor_payload),
+            xor_payload=bytes(xor_payload),
+        )
+        last = group[-1]
+        return build_packet(
+            packet_type=APP_INTERCOM_PKT_AUDIO_FEC,
+            channel=last.channel,
+            seq=base.seq,
+            timestamp_ms=last.timestamp_ms,
+            device=base.device,
+            payload=fec_payload,
+        )
 
 
 def run_udp(host: str, port: int, *, log_func=print) -> None:
@@ -319,9 +417,16 @@ def run_udp(host: str, port: int, *, log_func=print) -> None:
     nack_cache_packets = max(_env_int("INTERCOM_NACK_CACHE_PACKETS", DEFAULT_NACK_CACHE_PACKETS), 1)
     nack_cache_seconds = max(_env_float("INTERCOM_NACK_CACHE_SECONDS", DEFAULT_NACK_CACHE_SECONDS), 0.1)
     nack_max_count = max(_env_int("INTERCOM_NACK_MAX_COUNT", DEFAULT_NACK_MAX_COUNT), 1)
+    fec_group_size = max(_env_int("INTERCOM_FEC_GROUP_SIZE", DEFAULT_FEC_GROUP_SIZE), 2)
+    fec_log_every = max(audio_log_every // fec_group_size, 1) if audio_log_every > 0 else 0
     packet_cache = DownlinkPacketCache(
         max_packets_per_stream=nack_cache_packets,
         max_age_s=nack_cache_seconds,
+    )
+    fec_builder = FecGroupBuilder(
+        group_size=fec_group_size,
+        log_func=log_func,
+        log_every=fec_log_every,
     )
     log_func(f"UDP WTK1 监听 {host}:{port}")
     log_func(
@@ -332,6 +437,7 @@ def run_udp(host: str, port: int, *, log_func=print) -> None:
         f"prebuffer_idle_flush_ms={prebuffer_idle_flush_s * 1000:.1f} "
         f"queue_max_packets={queue_max_packets} "
         f"queue_high_water={queue_high_water} "
+        f"fec_group_size={fec_group_size} "
         f"nack_cache_packets={nack_cache_packets} "
         f"nack_cache_seconds={nack_cache_seconds:.1f} "
         f"nack_max_count={nack_max_count}"
@@ -403,9 +509,11 @@ def run_udp(host: str, port: int, *, log_func=print) -> None:
         if packet.packet_type == APP_INTERCOM_PKT_PTT_START:
             for target_device, target_addr in audio_targets(devices, packet, addr):
                 key = DownlinkKey(target_device=target_device, source_device=packet.device, channel=packet.channel)
+                fec_builder.reset(key)
                 get_downlink_queue(key, target_addr).reset_stream()
 
         if packet.packet_type == APP_INTERCOM_PKT_PTT_STOP:
+            fec_builder.reset_source(source_device=packet.device, channel=packet.channel)
             for key, queue in list(downlink_queues.items()):
                 if key.source_device == packet.device and key.channel == packet.channel:
                     queue.mark_source_stopped()
@@ -432,6 +540,9 @@ def run_udp(host: str, port: int, *, log_func=print) -> None:
                 key = DownlinkKey(target_device=target_device, source_device=packet.device, channel=packet.channel)
                 queue = get_downlink_queue(key, target_addr)
                 queue.enqueue_audio(downlink)
+                fec_packet = fec_builder.add_audio(key, packet)
+                if fec_packet is not None:
+                    queue.enqueue_packet(fec_packet)
                 if should_log_audio:
                     log_func(
                         f"UDP 音频入队 target={target_device}@{target_addr[0]}:{target_addr[1]} "

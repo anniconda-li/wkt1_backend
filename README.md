@@ -43,9 +43,24 @@ Byte 34+:   payload
 5 PTT_STOP
 6 HEARTBEAT
 7 NACK
+8 AUDIO_FEC
 ```
 
 `AUDIO` payload 保持设备端 PCM 原格式：PCM s16le / 16kHz / mono。服务端不改 packet type、header、seq、timestamp、device 字段或 payload 内容。
+
+`AUDIO_FEC` 是服务端下行前向纠错包。默认每 4 个连续 AUDIO 额外生成 1 个 XOR FEC 包，跟在该组最后一个 AUDIO 后进入同一个 paced 队列。FEC 只 XOR AUDIO payload，不改正常 AUDIO 包格式和 seq。
+
+`AUDIO_FEC` payload 为固定头加 XOR 数据：
+
+```text
+Byte 0-3:   base_seq uint32 little-endian，该组第一个 AUDIO seq
+Byte 4:     count uint8，默认 4
+Byte 5-6:   payload_len uint16 little-endian，当前 640
+Byte 7:     reserved，固定 0
+Byte 8+:    xor_payload[payload_len]
+```
+
+当一组 4 个 AUDIO 中恰好丢 1 个，设备端可用另外 3 个 AUDIO payload 与 `xor_payload` 再 XOR 恢复缺失的 PCM payload。
 
 `NACK` 是机会型补洞请求，不改变正常音频转发路径，也不要求设备播放等待重传。payload 为固定 24 字节小端结构：
 
@@ -110,6 +125,7 @@ INTERCOM_PREBUFFER_IDLE_FLUSH_MS=120
 INTERCOM_QUEUE_MAX_PACKETS=80
 INTERCOM_QUEUE_HIGH_WATER=60
 INTERCOM_AUDIO_LOG_EVERY_N=50
+INTERCOM_FEC_GROUP_SIZE=4
 INTERCOM_NACK_CACHE_PACKETS=200
 INTERCOM_NACK_CACHE_SECONDS=3
 INTERCOM_NACK_MAX_COUNT=16
@@ -123,6 +139,7 @@ INTERCOM_NACK_MAX_COUNT=16
 - `INTERCOM_QUEUE_MAX_PACKETS=80`：队列最多约 1.6s 音频，超过后丢最旧包，避免延迟无限增长。
 - `INTERCOM_QUEUE_HIGH_WATER=60`：队列达到高水位时打印告警。
 - `INTERCOM_AUDIO_LOG_EVERY_N=50`：音频热路径日志限频；设为 `0` 可关闭音频帧日志。
+- `INTERCOM_FEC_GROUP_SIZE=4`：每 4 个连续 AUDIO 生成 1 个 AUDIO_FEC 包。
 - `INTERCOM_NACK_CACHE_PACKETS=200`：每个目标/频道/源设备缓存最近 200 个已下发 AUDIO 包。
 - `INTERCOM_NACK_CACHE_SECONDS=3`：缓存最长保留 3 秒。
 - `INTERCOM_NACK_MAX_COUNT=16`：单个 NACK 最多补发 16 个连续 seq，防止一次请求挤爆下行。

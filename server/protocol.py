@@ -8,6 +8,7 @@ MAGIC = b"WTK1"
 HEADER_LEN = 34
 DEVICE_LEN = 16
 NACK_PAYLOAD_LEN = DEVICE_LEN + 2 + 4 + 2
+FEC_PAYLOAD_HEADER_LEN = 8
 
 APP_INTERCOM_PKT_REGISTER = 1
 APP_INTERCOM_PKT_CHANNEL = 2
@@ -16,6 +17,7 @@ APP_INTERCOM_PKT_AUDIO = 4
 APP_INTERCOM_PKT_PTT_STOP = 5
 APP_INTERCOM_PKT_HEARTBEAT = 6
 APP_INTERCOM_PKT_NACK = 7
+APP_INTERCOM_PKT_AUDIO_FEC = 8
 
 PKT_TYPES = {
     APP_INTERCOM_PKT_REGISTER: "register",
@@ -25,6 +27,7 @@ PKT_TYPES = {
     APP_INTERCOM_PKT_PTT_STOP: "ptt_stop",
     APP_INTERCOM_PKT_HEARTBEAT: "heartbeat",
     APP_INTERCOM_PKT_NACK: "nack",
+    APP_INTERCOM_PKT_AUDIO_FEC: "audio_fec",
 }
 
 
@@ -48,6 +51,16 @@ class NackRequest:
     channel: int
     start_seq: int
     count: int
+
+
+@dataclass(frozen=True)
+class FecPayload:
+    """Parsed AUDIO_FEC payload."""
+
+    base_seq: int
+    count: int
+    payload_len: int
+    xor_payload: bytes
 
 
 def read_u16(data: bytes, offset: int) -> int:
@@ -158,4 +171,43 @@ def parse_nack_payload(payload: bytes) -> NackRequest | None:
         channel=read_u16(payload, DEVICE_LEN),
         start_seq=read_u32(payload, DEVICE_LEN + 2),
         count=read_u16(payload, DEVICE_LEN + 6),
+    )
+
+
+def build_fec_payload(
+    *,
+    base_seq: int,
+    count: int,
+    payload_len: int,
+    xor_payload: bytes,
+) -> bytes:
+    """Build the fixed-width AUDIO_FEC payload header plus XOR bytes."""
+    if count <= 0 or count > 0xFF:
+        raise ValueError("fec count must fit uint8")
+    if payload_len <= 0 or payload_len > 0xFFFF:
+        raise ValueError("fec payload_len must fit uint16")
+    if len(xor_payload) != payload_len:
+        raise ValueError("fec xor_payload length mismatch")
+
+    out = bytearray(FEC_PAYLOAD_HEADER_LEN + payload_len)
+    write_u32(out, 0, base_seq & 0xFFFFFFFF)
+    out[4] = count & 0xFF
+    write_u16(out, 5, payload_len & 0xFFFF)
+    out[7] = 0
+    out[FEC_PAYLOAD_HEADER_LEN:] = xor_payload
+    return bytes(out)
+
+
+def parse_fec_payload(payload: bytes) -> FecPayload | None:
+    """Parse the AUDIO_FEC payload."""
+    if len(payload) < FEC_PAYLOAD_HEADER_LEN:
+        return None
+    payload_len = read_u16(payload, 5)
+    if len(payload) != FEC_PAYLOAD_HEADER_LEN + payload_len:
+        return None
+    return FecPayload(
+        base_seq=read_u32(payload, 0),
+        count=payload[4],
+        payload_len=payload_len,
+        xor_payload=payload[FEC_PAYLOAD_HEADER_LEN:],
     )

@@ -12,11 +12,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from server.protocol import (  # noqa: E402
     APP_INTERCOM_PKT_AUDIO,
+    APP_INTERCOM_PKT_AUDIO_FEC,
     APP_INTERCOM_PKT_NACK,
     HEADER_LEN,
     Packet,
+    build_fec_payload,
     build_nack_payload,
     build_packet,
+    parse_fec_payload,
     parse_nack_payload,
     parse_packet,
 )
@@ -24,6 +27,7 @@ from server.udp_server import (  # noqa: E402
     DownlinkKey,
     DownlinkPacketCache,
     DownlinkQueue,
+    FecGroupBuilder,
     audio_targets,
     build_audio_downlink_packet,
     handle_nack_packet,
@@ -82,6 +86,24 @@ class UdpPcmForwardTest(unittest.TestCase):
         self.assertEqual(packet.timestamp_ms, 123456)
         self.assertEqual(packet.device, "walkie-01")
         self.assertEqual(packet.payload, pcm)
+
+    def test_fec_payload_round_trips_binary_fields(self) -> None:
+        xor_payload = bytes([0x5A]) * 640
+        payload = build_fec_payload(
+            base_seq=100,
+            count=4,
+            payload_len=640,
+            xor_payload=xor_payload,
+        )
+
+        fec = parse_fec_payload(payload)
+
+        self.assertIsNotNone(fec)
+        assert fec is not None
+        self.assertEqual(fec.base_seq, 100)
+        self.assertEqual(fec.count, 4)
+        self.assertEqual(fec.payload_len, 640)
+        self.assertEqual(fec.xor_payload, xor_payload)
 
     def test_nack_payload_round_trips_binary_fields(self) -> None:
         payload = build_nack_payload(
@@ -272,6 +294,99 @@ class UdpPcmForwardTest(unittest.TestCase):
         self.assertIsNotNone(sent)
         assert sent is not None
         self.assertEqual(sent.seq, 20)
+
+    def test_fec_group_builder_generates_xor_after_four_contiguous_audio_packets(self) -> None:
+        logs: list[str] = []
+        builder = FecGroupBuilder(group_size=4, log_func=logs.append, log_every=1)
+        key = DownlinkKey(target_device="walkie-02", source_device="walkie-01", channel=1)
+        packets = [
+            parse_packet(_audio_packet(100, bytes([1]) * 640)),
+            parse_packet(_audio_packet(101, bytes([2]) * 640)),
+            parse_packet(_audio_packet(102, bytes([3]) * 640)),
+            parse_packet(_audio_packet(103, bytes([4]) * 640)),
+        ]
+        assert all(packet is not None for packet in packets)
+
+        out = None
+        for packet in packets:
+            assert packet is not None
+            out = builder.add_audio(key, packet)
+
+        self.assertIsNotNone(out)
+        fec_packet = parse_packet(out or b"")
+        self.assertIsNotNone(fec_packet)
+        assert fec_packet is not None
+        self.assertEqual(fec_packet.packet_type, APP_INTERCOM_PKT_AUDIO_FEC)
+        self.assertEqual(fec_packet.channel, 1)
+        self.assertEqual(fec_packet.seq, 100)
+        self.assertEqual(fec_packet.device, "walkie-01")
+        fec = parse_fec_payload(fec_packet.payload)
+        self.assertIsNotNone(fec)
+        assert fec is not None
+        self.assertEqual(fec.base_seq, 100)
+        self.assertEqual(fec.count, 4)
+        self.assertEqual(fec.payload_len, 640)
+        self.assertEqual(fec.xor_payload, bytes([1 ^ 2 ^ 3 ^ 4]) * 640)
+        self.assertIn("UDP fec enqueue", logs[-1])
+        self.assertIn("base=100", logs[-1])
+
+    def test_fec_group_builder_skips_non_contiguous_group_and_restarts(self) -> None:
+        logs: list[str] = []
+        builder = FecGroupBuilder(group_size=4, log_func=logs.append, log_every=1)
+        key = DownlinkKey(target_device="walkie-02", source_device="walkie-01", channel=1)
+        first = parse_packet(_audio_packet(100, b"\x01" * 640))
+        gap = parse_packet(_audio_packet(102, b"\x02" * 640))
+        assert first is not None
+        assert gap is not None
+
+        self.assertIsNone(builder.add_audio(key, first))
+        self.assertIsNone(builder.add_audio(key, gap))
+
+        self.assertIn("reason=non_contiguous", logs[-1])
+        out = None
+        for seq in (103, 104, 105):
+            packet = parse_packet(_audio_packet(seq, bytes([seq & 0xFF]) * 640))
+            assert packet is not None
+            out = builder.add_audio(key, packet)
+
+        self.assertIsNotNone(out)
+        fec_packet = parse_packet(out or b"")
+        self.assertIsNotNone(fec_packet)
+        assert fec_packet is not None
+        fec = parse_fec_payload(fec_packet.payload)
+        self.assertIsNotNone(fec)
+        assert fec is not None
+        self.assertEqual(fec.base_seq, 102)
+        self.assertEqual(fec.count, 4)
+
+    def test_fec_group_builder_skips_payload_len_mismatch_and_restarts(self) -> None:
+        logs: list[str] = []
+        builder = FecGroupBuilder(group_size=4, log_func=logs.append, log_every=1)
+        key = DownlinkKey(target_device="walkie-02", source_device="walkie-01", channel=1)
+        first = parse_packet(_audio_packet(200, b"\x01" * 640))
+        mismatch = parse_packet(_audio_packet(201, b"\x02\x02"))
+        assert first is not None
+        assert mismatch is not None
+
+        self.assertIsNone(builder.add_audio(key, first))
+        self.assertIsNone(builder.add_audio(key, mismatch))
+
+        self.assertIn("reason=payload_len_mismatch", logs[-1])
+        out = None
+        for seq in (202, 203, 204):
+            packet = parse_packet(_audio_packet(seq, bytes([seq & 0xFF]) * 2))
+            assert packet is not None
+            out = builder.add_audio(key, packet)
+
+        self.assertIsNotNone(out)
+        fec_packet = parse_packet(out or b"")
+        self.assertIsNotNone(fec_packet)
+        assert fec_packet is not None
+        fec = parse_fec_payload(fec_packet.payload)
+        self.assertIsNotNone(fec)
+        assert fec is not None
+        self.assertEqual(fec.base_seq, 201)
+        self.assertEqual(fec.payload_len, 2)
 
     def test_downlink_queue_caches_sent_audio_for_nack(self) -> None:
         fake_sock = FakeSocket()
