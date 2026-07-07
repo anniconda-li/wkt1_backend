@@ -13,6 +13,7 @@ import socket
 import time
 from typing import Protocol
 
+import core.config  # noqa: F401 - load project .env when UDP is started standalone
 from server.protocol import (
     APP_INTERCOM_PKT_AUDIO,
     APP_INTERCOM_PKT_AUDIO_OPUS,
@@ -73,6 +74,7 @@ class OpusDownlinkEncoder:
 
 def run_udp(host: str, port: int, *, log_func=print) -> None:
     """Run the blocking WTK1 UDP loop."""
+    configured_codec = os.getenv("INTERCOM_DOWNLINK_CODEC", "pcm").strip().lower() or "pcm"
     codec = downlink_codec_from_env()
     opus_encoder: AudioEncoder | None = None
     if codec == "opus":
@@ -92,6 +94,11 @@ def run_udp(host: str, port: int, *, log_func=print) -> None:
         log_func(f"UDP 绑定失败 {host}:{port}: {exc}")
         return
     log_func(f"UDP WTK1 监听 {host}:{port}")
+    log_func(
+        f"UDP downlink codec configured={configured_codec} effective={codec} "
+        f"opus_bitrate={_env_int('INTERCOM_OPUS_BITRATE', DEFAULT_OPUS_BITRATE)} "
+        f"opus_complexity={_env_int('INTERCOM_OPUS_COMPLEXITY', DEFAULT_OPUS_COMPLEXITY)}"
+    )
 
     devices: dict[str, tuple[str, int, int]] = {}
 
