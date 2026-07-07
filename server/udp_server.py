@@ -7,18 +7,20 @@ import os
 import socket
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
 
 from server.protocol import (
     APP_INTERCOM_PKT_AUDIO,
+    APP_INTERCOM_PKT_NACK,
     APP_INTERCOM_PKT_PTT_START,
     APP_INTERCOM_PKT_PTT_STOP,
     PKT_TYPES,
     Packet,
     HEADER_LEN,
     build_packet,
+    parse_nack_payload,
     parse_packet,
 )
 
@@ -29,6 +31,9 @@ DEFAULT_PREBUFFER_PACKETS = 20
 DEFAULT_PREBUFFER_IDLE_FLUSH_MS = 120
 DEFAULT_QUEUE_MAX_PACKETS = 80
 DEFAULT_QUEUE_HIGH_WATER = 60
+DEFAULT_NACK_CACHE_PACKETS = 200
+DEFAULT_NACK_CACHE_SECONDS = 3.0
+DEFAULT_NACK_MAX_COUNT = 16
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -57,6 +62,92 @@ class DownlinkKey:
     channel: int
 
 
+@dataclass(frozen=True)
+class DownlinkCacheKey:
+    target_device: str
+    source_device: str
+    channel: int
+
+
+@dataclass(frozen=True)
+class CachedAudioPacket:
+    packet_bytes: bytes
+    timestamp_ms: int
+    cached_at: float
+
+
+class DownlinkPacketCache:
+    """Short per-target/source cache of downlink AUDIO packets for NACK repair."""
+
+    def __init__(self, *, max_packets_per_stream: int, max_age_s: float) -> None:
+        self.max_packets_per_stream = max(max_packets_per_stream, 1)
+        self.max_age_s = max(max_age_s, 0.1)
+        self._streams: dict[DownlinkCacheKey, OrderedDict[int, CachedAudioPacket]] = {}
+        self._lock = threading.Lock()
+
+    def put(
+        self,
+        *,
+        target_device: str,
+        source_device: str,
+        channel: int,
+        seq: int,
+        timestamp_ms: int,
+        packet_bytes: bytes,
+    ) -> None:
+        now = time.monotonic()
+        stream_key = DownlinkCacheKey(
+            target_device=target_device,
+            source_device=source_device,
+            channel=channel,
+        )
+        with self._lock:
+            stream = self._streams.setdefault(stream_key, OrderedDict())
+            stream[seq] = CachedAudioPacket(
+                packet_bytes=packet_bytes,
+                timestamp_ms=timestamp_ms,
+                cached_at=now,
+            )
+            stream.move_to_end(seq)
+            self._prune_all_locked(now)
+
+    def get(self, *, target_device: str, source_device: str, channel: int, seq: int) -> bytes | None:
+        now = time.monotonic()
+        stream_key = DownlinkCacheKey(
+            target_device=target_device,
+            source_device=source_device,
+            channel=channel,
+        )
+        with self._lock:
+            stream = self._streams.get(stream_key)
+            if stream is None:
+                return None
+            self._prune_stream_locked(stream_key, stream, now)
+            cached = stream.get(seq)
+            if cached is None:
+                return None
+            return cached.packet_bytes
+
+    def _prune_stream_locked(
+        self,
+        stream_key: DownlinkCacheKey,
+        stream: OrderedDict[int, CachedAudioPacket],
+        now: float,
+    ) -> None:
+        expire_before = now - self.max_age_s
+        while stream:
+            _seq, oldest = next(iter(stream.items()))
+            if len(stream) <= self.max_packets_per_stream and oldest.cached_at >= expire_before:
+                break
+            stream.popitem(last=False)
+        if not stream:
+            self._streams.pop(stream_key, None)
+
+    def _prune_all_locked(self, now: float) -> None:
+        for stream_key, stream in list(self._streams.items()):
+            self._prune_stream_locked(stream_key, stream, now)
+
+
 class DownlinkQueue:
     """Per-target paced downlink queue for complete WTK1 AUDIO packets."""
 
@@ -67,6 +158,7 @@ class DownlinkQueue:
         target_addr: tuple[str, int],
         sock: socket.socket,
         send_lock: threading.Lock,
+        packet_cache: DownlinkPacketCache | None = None,
         log_func=print,
         interval_s: float,
         prebuffer_packets: int,
@@ -80,6 +172,7 @@ class DownlinkQueue:
         self.target_addr = target_addr
         self.sock = sock
         self.send_lock = send_lock
+        self.packet_cache = packet_cache
         self.log_func = log_func
         self.interval_s = max(interval_s, 0.001)
         self.prebuffer_packets = max(prebuffer_packets, 1)
@@ -176,6 +269,18 @@ class DownlinkQueue:
                         f"UDP paced send failed target={self.key.target_device} source={self.key.source_device} "
                         f"ch={self.key.channel} error={exc}"
                     )
+                else:
+                    if self.packet_cache is not None:
+                        packet = parse_packet(packet_bytes)
+                        if packet is not None:
+                            self.packet_cache.put(
+                                target_device=self.key.target_device,
+                                source_device=self.key.source_device,
+                                channel=self.key.channel,
+                                seq=packet.seq,
+                                timestamp_ms=packet.timestamp_ms,
+                                packet_bytes=packet_bytes,
+                            )
 
                 self.sent_count += 1
                 if self.log_every > 0 and self.sent_count % self.log_every == 0:
@@ -211,6 +316,13 @@ def run_udp(host: str, port: int, *, log_func=print) -> None:
     )
     queue_max_packets = max(_env_int("INTERCOM_QUEUE_MAX_PACKETS", DEFAULT_QUEUE_MAX_PACKETS), 1)
     queue_high_water = max(_env_int("INTERCOM_QUEUE_HIGH_WATER", DEFAULT_QUEUE_HIGH_WATER), 1)
+    nack_cache_packets = max(_env_int("INTERCOM_NACK_CACHE_PACKETS", DEFAULT_NACK_CACHE_PACKETS), 1)
+    nack_cache_seconds = max(_env_float("INTERCOM_NACK_CACHE_SECONDS", DEFAULT_NACK_CACHE_SECONDS), 0.1)
+    nack_max_count = max(_env_int("INTERCOM_NACK_MAX_COUNT", DEFAULT_NACK_MAX_COUNT), 1)
+    packet_cache = DownlinkPacketCache(
+        max_packets_per_stream=nack_cache_packets,
+        max_age_s=nack_cache_seconds,
+    )
     log_func(f"UDP WTK1 监听 {host}:{port}")
     log_func(
         "UDP downlink codec=pcm mode=paced "
@@ -219,7 +331,10 @@ def run_udp(host: str, port: int, *, log_func=print) -> None:
         f"prebuffer_packets={prebuffer_packets} "
         f"prebuffer_idle_flush_ms={prebuffer_idle_flush_s * 1000:.1f} "
         f"queue_max_packets={queue_max_packets} "
-        f"queue_high_water={queue_high_water}"
+        f"queue_high_water={queue_high_water} "
+        f"nack_cache_packets={nack_cache_packets} "
+        f"nack_cache_seconds={nack_cache_seconds:.1f} "
+        f"nack_max_count={nack_max_count}"
     )
 
     def get_downlink_queue(
@@ -233,6 +348,7 @@ def run_udp(host: str, port: int, *, log_func=print) -> None:
                 target_addr=target_addr,
                 sock=sock,
                 send_lock=send_lock,
+                packet_cache=packet_cache,
                 log_func=log_func,
                 interval_s=pacing_interval_s,
                 prebuffer_packets=prebuffer_packets,
@@ -266,6 +382,23 @@ def run_udp(host: str, port: int, *, log_func=print) -> None:
                 f"UDP {type_name} from {packet.device}@{addr[0]}:{addr[1]} "
                 f"ch={packet.channel} seq={packet.seq} payload={len(packet.payload)}"
             )
+
+        if packet.packet_type == APP_INTERCOM_PKT_NACK:
+            threading.Thread(
+                target=handle_nack_packet,
+                kwargs={
+                    "packet": packet,
+                    "requester_addr": addr,
+                    "packet_cache": packet_cache,
+                    "sock": sock,
+                    "send_lock": send_lock,
+                    "max_count": nack_max_count,
+                    "log_func": log_func,
+                },
+                name=f"udp-nack-{packet.device}",
+                daemon=True,
+            ).start()
+            continue
 
         if packet.packet_type == APP_INTERCOM_PKT_PTT_START:
             for target_device, target_addr in audio_targets(devices, packet, addr):
@@ -352,12 +485,101 @@ def build_audio_downlink_packet(
     )
 
 
+def handle_nack_packet(
+    *,
+    packet: Packet,
+    requester_addr: tuple[str, int],
+    packet_cache: DownlinkPacketCache,
+    sock: socket.socket,
+    send_lock: threading.Lock,
+    max_count: int,
+    log_func=print,
+) -> None:
+    """Opportunistically retransmit cached downlink AUDIO packets for one NACK."""
+    request = parse_nack_payload(packet.payload)
+    if request is None:
+        log_func(
+            f"UDP nack ignored requester={packet.device}@{requester_addr[0]}:{requester_addr[1]} "
+            f"reason=bad_payload payload={len(packet.payload)}"
+        )
+        return
+    if not packet.device:
+        log_func(
+            f"UDP nack ignored requester=@{requester_addr[0]}:{requester_addr[1]} "
+            "reason=empty_requester"
+        )
+        return
+    if request.count <= 0:
+        log_func(
+            f"UDP nack ignored requester={packet.device}@{requester_addr[0]}:{requester_addr[1]} "
+            f"source={request.source_device} ch={request.channel} start_seq={request.start_seq} reason=count_zero"
+        )
+        return
+    if not request.source_device or request.source_device == packet.device:
+        log_func(
+            f"UDP nack ignored requester={packet.device}@{requester_addr[0]}:{requester_addr[1]} "
+            f"source={request.source_device} ch={request.channel} reason=bad_source"
+        )
+        return
+    if request.channel != packet.channel:
+        log_func(
+            f"UDP nack ignored requester={packet.device}@{requester_addr[0]}:{requester_addr[1]} "
+            f"source={request.source_device} packet_ch={packet.channel} payload_ch={request.channel} "
+            "reason=channel_mismatch"
+        )
+        return
+
+    count = min(request.count, max_count)
+    sent = 0
+    missing = 0
+    failed = 0
+    for offset in range(count):
+        seq = (request.start_seq + offset) & 0xFFFFFFFF
+        packet_bytes = packet_cache.get(
+            target_device=packet.device,
+            source_device=request.source_device,
+            channel=request.channel,
+            seq=seq,
+        )
+        if packet_bytes is None:
+            missing += 1
+            continue
+        try:
+            with send_lock:
+                sock.sendto(packet_bytes, requester_addr)
+        except OSError as exc:
+            failed += 1
+            log_func(
+                f"UDP nack resend failed target={packet.device}@{requester_addr[0]}:{requester_addr[1]} "
+                f"source={request.source_device} ch={request.channel} seq={seq} error={exc}"
+            )
+        else:
+            sent += 1
+
+    clipped = request.count - count
+    log_func(
+        f"UDP nack handled requester={packet.device}@{requester_addr[0]}:{requester_addr[1]} "
+        f"source={request.source_device} ch={request.channel} start_seq={request.start_seq} "
+        f"count={request.count} sent={sent} missing={missing} failed={failed} clipped={clipped}"
+    )
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name, "").strip()
     if not raw:
         return default
     try:
         return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
     except ValueError:
         return default
 

@@ -12,16 +12,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from server.protocol import (  # noqa: E402
     APP_INTERCOM_PKT_AUDIO,
+    APP_INTERCOM_PKT_NACK,
     HEADER_LEN,
     Packet,
+    build_nack_payload,
     build_packet,
+    parse_nack_payload,
     parse_packet,
 )
 from server.udp_server import (  # noqa: E402
     DownlinkKey,
+    DownlinkPacketCache,
     DownlinkQueue,
     audio_targets,
     build_audio_downlink_packet,
+    handle_nack_packet,
 )
 
 
@@ -77,6 +82,23 @@ class UdpPcmForwardTest(unittest.TestCase):
         self.assertEqual(packet.timestamp_ms, 123456)
         self.assertEqual(packet.device, "walkie-01")
         self.assertEqual(packet.payload, pcm)
+
+    def test_nack_payload_round_trips_binary_fields(self) -> None:
+        payload = build_nack_payload(
+            source_device="walkie-01",
+            channel=3,
+            start_seq=123456,
+            count=8,
+        )
+
+        request = parse_nack_payload(payload)
+
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertEqual(request.source_device, "walkie-01")
+        self.assertEqual(request.channel, 3)
+        self.assertEqual(request.start_seq, 123456)
+        self.assertEqual(request.count, 8)
 
     def test_pcm_audio_packet_stays_pcm_downlink_packet(self) -> None:
         pcm = b"\x00\x00" * 320
@@ -250,6 +272,173 @@ class UdpPcmForwardTest(unittest.TestCase):
         self.assertIsNotNone(sent)
         assert sent is not None
         self.assertEqual(sent.seq, 20)
+
+    def test_downlink_queue_caches_sent_audio_for_nack(self) -> None:
+        fake_sock = FakeSocket()
+        packet_cache = DownlinkPacketCache(max_packets_per_stream=10, max_age_s=3.0)
+        queue = DownlinkQueue(
+            key=DownlinkKey(target_device="walkie-02", source_device="walkie-01", channel=1),
+            target_addr=("10.0.0.3", 19002),
+            sock=fake_sock,
+            send_lock=threading.Lock(),
+            packet_cache=packet_cache,
+            log_func=lambda _message: None,
+            interval_s=0.001,
+            prebuffer_packets=1,
+            prebuffer_idle_flush_s=0.02,
+            max_packets=10,
+            high_water_packets=8,
+            log_every=0,
+        )
+        audio = _audio_packet(30)
+
+        queue.enqueue_audio(audio)
+
+        self.assertTrue(_wait_until(lambda: len(fake_sock.sent) == 1))
+        cached = packet_cache.get(
+            target_device="walkie-02",
+            source_device="walkie-01",
+            channel=1,
+            seq=30,
+        )
+        self.assertEqual(cached, audio)
+
+    def test_downlink_packet_cache_evicts_oldest_per_stream(self) -> None:
+        packet_cache = DownlinkPacketCache(max_packets_per_stream=2, max_age_s=3.0)
+
+        for seq in (1, 2, 3):
+            packet_cache.put(
+                target_device="walkie-02",
+                source_device="walkie-01",
+                channel=1,
+                seq=seq,
+                timestamp_ms=seq * 20,
+                packet_bytes=_audio_packet(seq),
+            )
+
+        self.assertIsNone(
+            packet_cache.get(
+                target_device="walkie-02",
+                source_device="walkie-01",
+                channel=1,
+                seq=1,
+            )
+        )
+        self.assertEqual(
+            packet_cache.get(
+                target_device="walkie-02",
+                source_device="walkie-01",
+                channel=1,
+                seq=2,
+            ),
+            _audio_packet(2),
+        )
+        self.assertEqual(
+            packet_cache.get(
+                target_device="walkie-02",
+                source_device="walkie-01",
+                channel=1,
+                seq=3,
+            ),
+            _audio_packet(3),
+        )
+
+    def test_nack_retransmits_cached_audio_without_rewriting_packet(self) -> None:
+        fake_sock = FakeSocket()
+        packet_cache = DownlinkPacketCache(max_packets_per_stream=10, max_age_s=3.0)
+        cached_packets = [_audio_packet(seq) for seq in (100, 101, 103)]
+        for packet_bytes in cached_packets:
+            packet = parse_packet(packet_bytes)
+            assert packet is not None
+            packet_cache.put(
+                target_device="walkie-02",
+                source_device="walkie-01",
+                channel=1,
+                seq=packet.seq,
+                timestamp_ms=packet.timestamp_ms,
+                packet_bytes=packet_bytes,
+            )
+        nack = Packet(
+            packet_type=APP_INTERCOM_PKT_NACK,
+            channel=1,
+            seq=77,
+            timestamp_ms=999,
+            device="walkie-02",
+            payload=build_nack_payload(
+                source_device="walkie-01",
+                channel=1,
+                start_seq=100,
+                count=4,
+            ),
+        )
+        logs: list[str] = []
+
+        handle_nack_packet(
+            packet=nack,
+            requester_addr=("10.0.0.3", 19002),
+            packet_cache=packet_cache,
+            sock=fake_sock,
+            send_lock=threading.Lock(),
+            max_count=16,
+            log_func=logs.append,
+        )
+
+        self.assertEqual([data for data, _addr in fake_sock.sent], cached_packets)
+        self.assertEqual([addr for _data, addr in fake_sock.sent], [("10.0.0.3", 19002)] * 3)
+        self.assertIn("sent=3", logs[-1])
+        self.assertIn("missing=1", logs[-1])
+
+    def test_nack_ignores_bad_source_and_channel_mismatch(self) -> None:
+        fake_sock = FakeSocket()
+        packet_cache = DownlinkPacketCache(max_packets_per_stream=10, max_age_s=3.0)
+        logs: list[str] = []
+
+        handle_nack_packet(
+            packet=Packet(
+                packet_type=APP_INTERCOM_PKT_NACK,
+                channel=1,
+                seq=1,
+                timestamp_ms=1,
+                device="walkie-02",
+                payload=build_nack_payload(
+                    source_device="walkie-02",
+                    channel=1,
+                    start_seq=100,
+                    count=1,
+                ),
+            ),
+            requester_addr=("10.0.0.3", 19002),
+            packet_cache=packet_cache,
+            sock=fake_sock,
+            send_lock=threading.Lock(),
+            max_count=16,
+            log_func=logs.append,
+        )
+        handle_nack_packet(
+            packet=Packet(
+                packet_type=APP_INTERCOM_PKT_NACK,
+                channel=1,
+                seq=2,
+                timestamp_ms=2,
+                device="walkie-02",
+                payload=build_nack_payload(
+                    source_device="walkie-01",
+                    channel=2,
+                    start_seq=100,
+                    count=1,
+                ),
+            ),
+            requester_addr=("10.0.0.3", 19002),
+            packet_cache=packet_cache,
+            sock=fake_sock,
+            send_lock=threading.Lock(),
+            max_count=16,
+            log_func=logs.append,
+        )
+
+        self.assertEqual(fake_sock.sent, [])
+        self.assertIn("reason=bad_source", logs[0])
+        self.assertIn("reason=channel_mismatch", logs[1])
 
 
 if __name__ == "__main__":

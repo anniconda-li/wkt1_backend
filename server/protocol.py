@@ -7,6 +7,7 @@ from dataclasses import dataclass
 MAGIC = b"WTK1"
 HEADER_LEN = 34
 DEVICE_LEN = 16
+NACK_PAYLOAD_LEN = DEVICE_LEN + 2 + 4 + 2
 
 APP_INTERCOM_PKT_REGISTER = 1
 APP_INTERCOM_PKT_CHANNEL = 2
@@ -14,6 +15,7 @@ APP_INTERCOM_PKT_PTT_START = 3
 APP_INTERCOM_PKT_AUDIO = 4
 APP_INTERCOM_PKT_PTT_STOP = 5
 APP_INTERCOM_PKT_HEARTBEAT = 6
+APP_INTERCOM_PKT_NACK = 7
 
 PKT_TYPES = {
     APP_INTERCOM_PKT_REGISTER: "register",
@@ -22,6 +24,7 @@ PKT_TYPES = {
     APP_INTERCOM_PKT_AUDIO: "audio",
     APP_INTERCOM_PKT_PTT_STOP: "ptt_stop",
     APP_INTERCOM_PKT_HEARTBEAT: "heartbeat",
+    APP_INTERCOM_PKT_NACK: "nack",
 }
 
 
@@ -35,6 +38,16 @@ class Packet:
     timestamp_ms: int
     device: str
     payload: bytes
+
+
+@dataclass(frozen=True)
+class NackRequest:
+    """Parsed NACK request payload."""
+
+    source_device: str
+    channel: int
+    start_seq: int
+    count: int
 
 
 def read_u16(data: bytes, offset: int) -> int:
@@ -115,4 +128,34 @@ def parse_packet(data: bytes) -> Packet | None:
         timestamp_ms=read_u32(data, 12),
         device=device_raw.decode("utf-8", errors="replace"),
         payload=data[header_len : header_len + payload_len],
+    )
+
+
+def build_nack_payload(
+    *,
+    source_device: str,
+    channel: int,
+    start_seq: int,
+    count: int,
+) -> bytes:
+    """Build the fixed-width binary NACK payload."""
+    out = bytearray(NACK_PAYLOAD_LEN)
+    source_bytes = (source_device or "").encode("utf-8", errors="ignore")[:DEVICE_LEN]
+    out[: len(source_bytes)] = source_bytes
+    write_u16(out, DEVICE_LEN, channel & 0xFFFF)
+    write_u32(out, DEVICE_LEN + 2, start_seq & 0xFFFFFFFF)
+    write_u16(out, DEVICE_LEN + 6, count & 0xFFFF)
+    return bytes(out)
+
+
+def parse_nack_payload(payload: bytes) -> NackRequest | None:
+    """Parse the fixed-width binary NACK payload."""
+    if len(payload) < NACK_PAYLOAD_LEN:
+        return None
+    source_raw = payload[:DEVICE_LEN].split(b"\x00", 1)[0]
+    return NackRequest(
+        source_device=source_raw.decode("utf-8", errors="replace"),
+        channel=read_u16(payload, DEVICE_LEN),
+        start_seq=read_u32(payload, DEVICE_LEN + 2),
+        count=read_u16(payload, DEVICE_LEN + 6),
     )
