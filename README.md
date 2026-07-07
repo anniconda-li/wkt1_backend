@@ -76,9 +76,11 @@ FFMPEG_BIN=ffmpeg
 INTERCOM_DOWNLINK_CODEC=opus
 INTERCOM_OPUS_BITRATE=20000
 INTERCOM_OPUS_COMPLEXITY=3
+INTERCOM_AUDIO_LOG_EVERY_N=50
 ```
 
 设备上行仍是 `APP_INTERCOM_PKT_AUDIO=4`、16 kHz mono s16le、20 ms、640B payload。服务器在 Opus 模式下只把下行改成 `APP_INTERCOM_PKT_AUDIO_OPUS=7`，payload 是 raw Opus frame。
+`INTERCOM_AUDIO_LOG_EVERY_N` 用来限制音频热路径日志，默认每路每 50 帧约 1 秒打印一次；设置为 `0` 可关闭音频帧日志，避免日志 I/O 影响 UDP 转发节奏。
 
 健康检查：
 

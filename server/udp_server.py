@@ -29,6 +29,7 @@ OPUS_SAMPLE_RATE = 16000
 OPUS_CHANNELS = 1
 DEFAULT_OPUS_BITRATE = 20000
 DEFAULT_OPUS_COMPLEXITY = 3
+DEFAULT_AUDIO_LOG_EVERY_N = 50
 DOWNLINK_CODECS = {"pcm", "opus"}
 
 
@@ -97,10 +98,13 @@ def run_udp(host: str, port: int, *, log_func=print) -> None:
     log_func(
         f"UDP downlink codec configured={configured_codec} effective={codec} "
         f"opus_bitrate={_env_int('INTERCOM_OPUS_BITRATE', DEFAULT_OPUS_BITRATE)} "
-        f"opus_complexity={_env_int('INTERCOM_OPUS_COMPLEXITY', DEFAULT_OPUS_COMPLEXITY)}"
+        f"opus_complexity={_env_int('INTERCOM_OPUS_COMPLEXITY', DEFAULT_OPUS_COMPLEXITY)} "
+        f"audio_log_every={_env_int('INTERCOM_AUDIO_LOG_EVERY_N', DEFAULT_AUDIO_LOG_EVERY_N)}"
     )
 
     devices: dict[str, tuple[str, int, int]] = {}
+    audio_counters: dict[tuple[str, int], int] = {}
+    audio_log_every = max(_env_int("INTERCOM_AUDIO_LOG_EVERY_N", DEFAULT_AUDIO_LOG_EVERY_N), 0)
 
     while True:
         data, addr = sock.recvfrom(2048)
@@ -111,24 +115,33 @@ def run_udp(host: str, port: int, *, log_func=print) -> None:
 
         type_name = PKT_TYPES.get(packet.packet_type, f"type_{packet.packet_type}")
         devices[packet.device] = (addr[0], addr[1], packet.channel)
-        log_func(
-            f"UDP {type_name} from {packet.device}@{addr[0]}:{addr[1]} "
-            f"ch={packet.channel} seq={packet.seq} payload={len(packet.payload)}"
-        )
+        should_log_audio = True
+        if packet.packet_type == APP_INTERCOM_PKT_AUDIO and packet.payload:
+            counter_key = (packet.device, packet.channel)
+            audio_counters[counter_key] = audio_counters.get(counter_key, 0) + 1
+            should_log_audio = audio_log_every > 0 and audio_counters[counter_key] % audio_log_every == 0
+
+        if packet.packet_type != APP_INTERCOM_PKT_AUDIO or should_log_audio:
+            log_func(
+                f"UDP {type_name} from {packet.device}@{addr[0]}:{addr[1]} "
+                f"ch={packet.channel} seq={packet.seq} payload={len(packet.payload)}"
+            )
 
         if packet.packet_type == APP_INTERCOM_PKT_AUDIO and packet.payload:
             targets = audio_targets(devices, packet, addr)
             if not targets:
-                log_func(
-                    f"UDP audio downlink skipped source={packet.device} ch={packet.channel} "
-                    f"pcm_payload_len={len(packet.payload)} target_count=0"
-                )
+                if should_log_audio:
+                    log_func(
+                        f"UDP audio downlink skipped source={packet.device} ch={packet.channel} "
+                        f"pcm_payload_len={len(packet.payload)} target_count=0"
+                    )
                 continue
             downlink = build_audio_downlink_packet(
                 packet,
                 codec=codec,
                 opus_encoder=opus_encoder,
                 target_count=len(targets),
+                log_audio=should_log_audio,
                 log_func=log_func,
             )
             if downlink is None:
@@ -137,10 +150,11 @@ def run_udp(host: str, port: int, *, log_func=print) -> None:
             packet_type = downlink[4]
             for dev, dev_addr in targets:
                 sock.sendto(downlink, dev_addr)
-                log_func(
-                    f"UDP 音频转发至 {dev}@{dev_addr[0]}:{dev_addr[1]} "
-                    f"type={PKT_TYPES.get(packet_type, packet_type)} payload={payload_len}"
-                )
+                if should_log_audio:
+                    log_func(
+                        f"UDP 音频转发至 {dev}@{dev_addr[0]}:{dev_addr[1]} "
+                        f"type={PKT_TYPES.get(packet_type, packet_type)} payload={payload_len}"
+                    )
 
 
 def downlink_codec_from_env() -> str:
@@ -170,6 +184,7 @@ def build_audio_downlink_packet(
     codec: str,
     opus_encoder: AudioEncoder | None,
     target_count: int = 0,
+    log_audio: bool = True,
     log_func=print,
 ) -> bytes | None:
     """Build one downlink audio packet from one upstream PCM packet."""
@@ -202,12 +217,13 @@ def build_audio_downlink_packet(
                 actual_codec = "pcm"
             encode_cost = time.perf_counter() - encode_start
 
-    log_func(
-        f"UDP audio downlink codec={actual_codec} source={packet.device} ch={packet.channel} "
-        f"pcm_payload_len={pcm_len} downlink_payload_len={len(payload)} "
-        f"opus_payload_len={len(payload) if actual_codec == 'opus' else 0} "
-        f"encode_ms={encode_cost * 1000:.2f} target_count={target_count}"
-    )
+    if log_audio:
+        log_func(
+            f"UDP audio downlink codec={actual_codec} source={packet.device} ch={packet.channel} "
+            f"pcm_payload_len={pcm_len} downlink_payload_len={len(payload)} "
+            f"opus_payload_len={len(payload) if actual_codec == 'opus' else 0} "
+            f"encode_ms={encode_cost * 1000:.2f} target_count={target_count}"
+        )
     return build_packet(
         packet_type=packet_type,
         channel=packet.channel,
