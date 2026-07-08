@@ -116,9 +116,9 @@ UDP WTK1 监听 0.0.0.0:19000
 UDP downlink codec=pcm mode=paced ...
 ```
 
-## WebSocket 下行实验模式
+## WebSocket 全双工实验模式
 
-默认仍是 UDP 下行。需要验证 TCP/WebSocket 有序可靠下行时，把 `.env` 改为：
+默认仍是 UDP。需要验证 WebSocket 全双工时，把 `.env` 改为：
 
 ```text
 INTERCOM_DOWNLINK_TRANSPORT=websocket
@@ -128,13 +128,13 @@ INTERCOM_WS_QUEUE_MAX_AUDIO=50
 INTERCOM_WS_QUEUE_HIGH_WATER_AUDIO=40
 ```
 
-设备端仍然通过 UDP `19000` 上行 `REGISTER / CHANNEL / HEARTBEAT / PTT_START / AUDIO / PTT_STOP`。设备端另外保持一个长连接：
+设备端可以继续通过 UDP `19000` 上行 `REGISTER / CHANNEL / HEARTBEAT / PTT_START / AUDIO / PTT_STOP`，也可以通过同一个 WebSocket 长连接发送完整 WTK1 binary packet 上行：
 
 ```text
 ws://<server-ip>:18080/intercom/ws?device=walkie-02
 ```
 
-服务器用 query 参数里的 `device` 绑定连接；同一个 device 重连时，新连接覆盖旧连接并关闭旧连接。WebSocket binary frame 的内容就是完整 WTK1 packet bytes：
+服务器用 query 参数里的 `device` 绑定连接；同一个 device 重连时，新连接覆盖旧连接并关闭旧连接。WebSocket 上行和下行 binary frame 的内容都是完整 WTK1 packet bytes：
 
 ```text
 WTK1 34-byte header + payload
@@ -142,13 +142,14 @@ WTK1 34-byte header + payload
 
 不包装 JSON，不 base64，不改变 PCM、WTK1 header、seq、timestamp、device 或 20ms/640B 音频包大小。
 
-WebSocket 模式下，服务器只把 `PTT_START / AUDIO / PTT_STOP` 推给同频道其他设备；`HEARTBEAT` 不通过 WebSocket 转发，`FEC / NACK` 不参与 WebSocket 下行。目标设备 WebSocket 不在线时，服务端直接丢弃该目标下行并打印 `websocket target offline`，不会 fallback 到 UDP，便于观察实验效果。
+WebSocket 模式下，服务器会监听设备发来的 binary message，解析为 WTK1 后进入和 UDP 上行相同的处理管线。下行优先走目标设备的 WebSocket；如果目标设备 WebSocket 不在线但有 UDP 注册地址，会回退到 UDP paced queue。`HEARTBEAT / REGISTER / CHANNEL` 用于更新设备在线和频道状态；`FEC / NACK` 仍只服务 UDP 下行链路。
 
 WebSocket 下行也有 per-device 队列和 20ms pacing；`INTERCOM_WS_QUEUE_MAX_AUDIO=50` 表示最多保留约 1 秒 audio。超过上限时丢最旧 AUDIO，保留最新 AUDIO。`PTT_STOP` 默认不会清理已经入队的 audio，而是排在当前语音流尾部发送；只有队列超过 `INTERCOM_WS_QUEUE_HIGH_WATER_AUDIO` 或连接异常时才会清理旧 audio，并打印 clear reason。
 
 定位 seq gap 时重点看两类日志：
 
 ```text
+ws_uplink_rx ws_uplink_audio source=walkie-01 ch=1 type=audio seq=123 payload=640
 UDP uplink stats source=walkie-01 addr=... ch=1 rx=50 gap=2/6 late=0 dup=0 far=0 expected=1234 last_rx=1233
 WS downlink stats target=walkie-02 source=walkie-01 ch=1 enqueue=50 send=50 drop=0 clear=0 queue_len=2 queue_max=4 pacing_lag_ms=0.30
 ```
@@ -193,7 +194,8 @@ INTERCOM_SEQ_FAR_JUMP_FRAMES=1000
 - `INTERCOM_NACK_CACHE_PACKETS=200`：每个目标/频道/源设备缓存最近 200 个已下发 AUDIO 包。
 - `INTERCOM_NACK_CACHE_SECONDS=3`：缓存最长保留 3 秒。
 - `INTERCOM_NACK_MAX_COUNT=16`：单个 NACK 最多补发 16 个连续 seq，防止一次请求挤爆下行。
-- `INTERCOM_DOWNLINK_TRANSPORT=udp`：下行使用 UDP；改为 `websocket` 后，上行仍走 UDP，下行改走 `/intercom/ws`。
+- `INTERCOM_DOWNLINK_TRANSPORT=udp`：默认 UDP 转发；改为 `websocket` 后，WebSocket 上行可用，下行优先走 `/intercom/ws`，目标无 WS 时回退 UDP。
+- WebSocket 上行 binary frame 也是完整 WTK1 packet；UDP fallback 仍保留。
 - `INTERCOM_WS_QUEUE_MAX_AUDIO=50`：WebSocket 每设备最多保留约 1 秒 audio，超限丢最旧 audio。
 - `INTERCOM_WS_QUEUE_HIGH_WATER_AUDIO=40`：`PTT_STOP` 到来时，只有积压超过该值才会清 audio。
 - `INTERCOM_WS_PING_INTERVAL_SECONDS=20`：WebSocket ping/pong 保活间隔。

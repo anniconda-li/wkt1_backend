@@ -458,6 +458,7 @@ class UdpPcmForwardTest(unittest.TestCase):
 
     def test_uplink_audio_stats_detects_gap_late_dup_and_wrap(self) -> None:
         stats = UplinkAudioStats(
+            transport="UDP",
             source_device="walkie-01",
             channel=1,
             log_every=50,
@@ -483,6 +484,7 @@ class UdpPcmForwardTest(unittest.TestCase):
 
     def test_uplink_audio_stats_far_jump_resyncs_without_gap_pollution(self) -> None:
         stats = UplinkAudioStats(
+            transport="WS",
             source_device="walkie-01",
             channel=1,
             log_every=50,
