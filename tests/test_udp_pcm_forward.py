@@ -14,6 +14,8 @@ from server.protocol import (  # noqa: E402
     APP_INTERCOM_PKT_AUDIO,
     APP_INTERCOM_PKT_AUDIO_FEC,
     APP_INTERCOM_PKT_NACK,
+    APP_INTERCOM_PKT_PTT_START,
+    APP_INTERCOM_PKT_PTT_STOP,
     HEADER_LEN,
     Packet,
     build_fec_payload,
@@ -28,8 +30,11 @@ from server.udp_server import (  # noqa: E402
     DownlinkPacketCache,
     DownlinkQueue,
     FecGroupBuilder,
+    WebSocketDownlinkItem,
+    WebSocketDownlinkQueue,
     audio_targets,
     build_audio_downlink_packet,
+    exact_wtk1_packet_bytes,
     handle_nack_packet,
 )
 
@@ -51,6 +56,17 @@ def _audio_packet(seq: int, payload: bytes | None = None) -> bytes:
         timestamp_ms=seq * 20,
         device="walkie-01",
         payload=payload if payload is not None else b"\x00\x00" * 320,
+    )
+
+
+def _control_packet(packet_type: int, seq: int) -> bytes:
+    return build_packet(
+        packet_type=packet_type,
+        channel=1,
+        seq=seq,
+        timestamp_ms=seq * 20,
+        device="walkie-01",
+        payload=b"",
     )
 
 
@@ -154,6 +170,16 @@ class UdpPcmForwardTest(unittest.TestCase):
         self.assertIn("pcm_payload_len=640", logs[-1])
         self.assertIn("downlink_payload_len=640", logs[-1])
         self.assertIn("target_count=2", logs[-1])
+
+    def test_exact_wtk1_packet_bytes_strips_udp_trailing_data(self) -> None:
+        packet_bytes = _audio_packet(88)
+        parsed = parse_packet(packet_bytes + b"trailing")
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+
+        out = exact_wtk1_packet_bytes(packet_bytes + b"trailing", parsed)
+
+        self.assertEqual(out, packet_bytes)
 
     def test_large_pcm_audio_packet_is_forwarded_as_is(self) -> None:
         pcm = b"\x55\x66" * 640
@@ -294,6 +320,121 @@ class UdpPcmForwardTest(unittest.TestCase):
         self.assertIsNotNone(sent)
         assert sent is not None
         self.assertEqual(sent.seq, 20)
+
+    def test_websocket_queue_drops_oldest_audio_when_full(self) -> None:
+        logs: list[str] = []
+        queue = WebSocketDownlinkQueue(
+            target_device="walkie-02",
+            max_audio_packets=3,
+            log_func=logs.append,
+            log_every=0,
+        )
+
+        for seq in range(5):
+            queue.enqueue(
+                WebSocketDownlinkItem(
+                    packet_bytes=_audio_packet(seq),
+                    packet_type=APP_INTERCOM_PKT_AUDIO,
+                    source_device="walkie-01",
+                    channel=1,
+                )
+            )
+
+        queued: list[int] = []
+        while True:
+            item = queue.get()
+            if item is None:
+                break
+            packet = parse_packet(item.packet_bytes)
+            self.assertIsNotNone(packet)
+            assert packet is not None
+            queued.append(packet.seq)
+            if not queue.queue_len():
+                break
+
+        self.assertEqual(queued, [2, 3, 4])
+        self.assertEqual(queue.drop_count, 2)
+        self.assertTrue(any("websocket drop old audio" in item for item in logs))
+
+    def test_websocket_queue_ptt_stop_clears_old_audio_and_keeps_stop_first(self) -> None:
+        queue = WebSocketDownlinkQueue(
+            target_device="walkie-02",
+            max_audio_packets=10,
+            log_func=lambda _message: None,
+            log_every=0,
+        )
+        for seq in (10, 11, 12):
+            queue.enqueue(
+                WebSocketDownlinkItem(
+                    packet_bytes=_audio_packet(seq),
+                    packet_type=APP_INTERCOM_PKT_AUDIO,
+                    source_device="walkie-01",
+                    channel=1,
+                )
+            )
+        stop = _control_packet(APP_INTERCOM_PKT_PTT_STOP, 13)
+
+        queue.enqueue(
+            WebSocketDownlinkItem(
+                packet_bytes=stop,
+                packet_type=APP_INTERCOM_PKT_PTT_STOP,
+                source_device="walkie-01",
+                channel=1,
+            )
+        )
+
+        item = queue.get()
+        self.assertIsNotNone(item)
+        assert item is not None
+        parsed = parse_packet(item.packet_bytes)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.packet_type, APP_INTERCOM_PKT_PTT_STOP)
+        self.assertEqual(parsed.seq, 13)
+        self.assertEqual(queue.queue_len(), 0)
+
+    def test_websocket_queue_control_order_before_audio(self) -> None:
+        queue = WebSocketDownlinkQueue(
+            target_device="walkie-02",
+            max_audio_packets=10,
+            log_func=lambda _message: None,
+            log_every=0,
+        )
+        start = _control_packet(APP_INTERCOM_PKT_PTT_START, 1)
+        stop = _control_packet(APP_INTERCOM_PKT_PTT_STOP, 2)
+        queue.enqueue(
+            WebSocketDownlinkItem(
+                packet_bytes=start,
+                packet_type=APP_INTERCOM_PKT_PTT_START,
+                source_device="walkie-01",
+                channel=1,
+            )
+        )
+        queue.enqueue(
+            WebSocketDownlinkItem(
+                packet_bytes=_audio_packet(3),
+                packet_type=APP_INTERCOM_PKT_AUDIO,
+                source_device="walkie-01",
+                channel=1,
+            )
+        )
+        queue.enqueue(
+            WebSocketDownlinkItem(
+                packet_bytes=stop,
+                packet_type=APP_INTERCOM_PKT_PTT_STOP,
+                source_device="walkie-01",
+                channel=1,
+            )
+        )
+
+        first = queue.get()
+        second = queue.get()
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        assert first is not None
+        assert second is not None
+        self.assertEqual(parse_packet(first.packet_bytes).packet_type, APP_INTERCOM_PKT_PTT_START)
+        self.assertEqual(parse_packet(second.packet_bytes).packet_type, APP_INTERCOM_PKT_PTT_STOP)
 
     def test_fec_group_builder_generates_xor_after_four_contiguous_audio_packets(self) -> None:
         logs: list[str] = []

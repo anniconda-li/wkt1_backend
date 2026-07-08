@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
 import os
 import socket
 import threading
 import time
+from typing import Any
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from server.protocol import (
     APP_INTERCOM_PKT_AUDIO,
@@ -38,6 +42,9 @@ DEFAULT_NACK_CACHE_PACKETS = 200
 DEFAULT_NACK_CACHE_SECONDS = 3.0
 DEFAULT_NACK_MAX_COUNT = 16
 DEFAULT_FEC_GROUP_SIZE = 4
+DEFAULT_WS_PORT = 18080
+DEFAULT_WS_QUEUE_MAX_AUDIO = 50
+DEFAULT_WS_PING_INTERVAL_SECONDS = 20
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -312,6 +319,353 @@ class DownlinkQueue:
                     next_send = now + self.interval_s
 
 
+@dataclass(frozen=True)
+class WebSocketDownlinkItem:
+    """One complete WTK1 packet waiting for WebSocket downlink."""
+
+    packet_bytes: bytes
+    packet_type: int
+    source_device: str
+    channel: int
+
+
+class WebSocketDownlinkQueue:
+    """Per-device WebSocket downlink queue with bounded audio backlog."""
+
+    def __init__(
+        self,
+        *,
+        target_device: str,
+        max_audio_packets: int,
+        log_func=print,
+        log_every: int,
+    ) -> None:
+        self.target_device = target_device
+        self.max_audio_packets = max(max_audio_packets, 1)
+        self.log_func = log_func
+        self.log_every = max(log_every, 0)
+        self.drop_count = 0
+        self.enqueued_audio_count = 0
+        self.sent_audio_count = 0
+        self._queue: deque[WebSocketDownlinkItem] = deque()
+        self._audio_count = 0
+        self._closed = False
+        self._condition = threading.Condition()
+
+    def enqueue(self, item: WebSocketDownlinkItem) -> bool:
+        with self._condition:
+            if self._closed:
+                return False
+            if item.packet_type == APP_INTERCOM_PKT_PTT_START:
+                self._clear_audio_locked(item.source_device, item.channel, reason="ptt_start")
+                self._append_priority_control_locked(item)
+                self._log_enqueue_locked(item)
+            elif item.packet_type == APP_INTERCOM_PKT_PTT_STOP:
+                self._clear_audio_locked(item.source_device, item.channel, reason="ptt_stop")
+                self._append_priority_control_locked(item)
+                self._log_enqueue_locked(item)
+            else:
+                if item.packet_type == APP_INTERCOM_PKT_AUDIO:
+                    self._drop_oldest_audio_until_room_locked()
+                    self._audio_count += 1
+                    self.enqueued_audio_count += 1
+                self._queue.append(item)
+                self._log_enqueue_locked(item)
+            self._condition.notify()
+            return True
+
+    def get(self) -> WebSocketDownlinkItem | None:
+        with self._condition:
+            while not self._queue and not self._closed:
+                self._condition.wait()
+            if not self._queue:
+                return None
+            item = self._queue.popleft()
+            if item.packet_type == APP_INTERCOM_PKT_AUDIO:
+                self._audio_count = max(self._audio_count - 1, 0)
+            return item
+
+    def close(self) -> None:
+        with self._condition:
+            self._closed = True
+            self._queue.clear()
+            self._audio_count = 0
+            self._condition.notify_all()
+
+    def queue_len(self) -> int:
+        with self._condition:
+            return len(self._queue)
+
+    def _append_priority_control_locked(self, item: WebSocketDownlinkItem) -> None:
+        items = list(self._queue)
+        insert_at = 0
+        while insert_at < len(items) and items[insert_at].packet_type != APP_INTERCOM_PKT_AUDIO:
+            insert_at += 1
+        items.insert(insert_at, item)
+        self._queue = deque(items)
+
+    def _clear_audio_locked(self, source_device: str, channel: int, *, reason: str) -> None:
+        kept: deque[WebSocketDownlinkItem] = deque()
+        cleared = 0
+        for queued in self._queue:
+            if (
+                queued.packet_type == APP_INTERCOM_PKT_AUDIO
+                and queued.source_device == source_device
+                and queued.channel == channel
+            ):
+                cleared += 1
+                continue
+            kept.append(queued)
+        if cleared:
+            self._queue = kept
+            self._audio_count = max(self._audio_count - cleared, 0)
+            self.log_func(
+                f"websocket clear queued audio target={self.target_device} source={source_device} "
+                f"ch={channel} reason={reason} cleared={cleared} queue_len={len(self._queue)}"
+            )
+
+    def _drop_oldest_audio_until_room_locked(self) -> None:
+        while self._audio_count >= self.max_audio_packets:
+            items = list(self._queue)
+            drop_index = next(
+                (index for index, queued in enumerate(items) if queued.packet_type == APP_INTERCOM_PKT_AUDIO),
+                None,
+            )
+            if drop_index is None:
+                self._audio_count = 0
+                return
+            items.pop(drop_index)
+            self._queue = deque(items)
+            self._audio_count -= 1
+            self.drop_count += 1
+            self.log_func(
+                f"websocket drop old audio target={self.target_device} "
+                f"drop_count={self.drop_count} queue_len={len(self._queue)}"
+            )
+
+    def _log_enqueue_locked(self, item: WebSocketDownlinkItem) -> None:
+        type_name = PKT_TYPES.get(item.packet_type, f"type_{item.packet_type}")
+        if item.packet_type == APP_INTERCOM_PKT_AUDIO:
+            if self.log_every <= 0 and self.enqueued_audio_count > 1:
+                return
+            if self.log_every > 0 and self.enqueued_audio_count % self.log_every != 0:
+                return
+        self.log_func(
+            f"websocket downlink enqueue target={self.target_device} source={item.source_device} "
+            f"type={type_name} ch={item.channel} queue_len={len(self._queue)}"
+        )
+
+
+@dataclass
+class WebSocketConnection:
+    device: str
+    websocket: Any
+    queue: WebSocketDownlinkQueue
+
+
+class WebSocketDownlinkServer:
+    """Device-bound WebSocket server for experimental downlink transport."""
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        port: int,
+        interval_s: float,
+        max_audio_packets: int,
+        log_func=print,
+        log_every: int,
+        ping_interval_s: int,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.interval_s = max(interval_s, 0.001)
+        self.max_audio_packets = max(max_audio_packets, 1)
+        self.log_func = log_func
+        self.log_every = max(log_every, 0)
+        self.ping_interval_s = max(ping_interval_s, 1)
+        self._connections: dict[str, WebSocketConnection] = {}
+        self._connections_lock = threading.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._server: Any = None
+        self._thread: threading.Thread | None = None
+        self._started = threading.Event()
+        self._start_error: Exception | None = None
+        self._offline_log_at: dict[str, float] = {}
+
+    def start(self) -> bool:
+        if self._thread is not None:
+            return True
+        self._thread = threading.Thread(target=self._run_loop, name="intercom-websocket", daemon=True)
+        self._thread.start()
+        if not self._started.wait(timeout=3.0):
+            self.log_func(f"websocket server start timeout host={self.host} port={self.port}")
+            return False
+        if self._start_error is not None:
+            self.log_func(f"websocket server start failed host={self.host} port={self.port} error={self._start_error}")
+            return False
+        return True
+
+    def enqueue(self, target_device: str, item: WebSocketDownlinkItem) -> bool:
+        with self._connections_lock:
+            connection = self._connections.get(target_device)
+        if connection is None:
+            now = time.monotonic()
+            last = self._offline_log_at.get(target_device, 0.0)
+            if now - last >= 1.0:
+                self._offline_log_at[target_device] = now
+                self.log_func(f"websocket target offline target={target_device} source={item.source_device} ch={item.channel}")
+            return False
+        return connection.queue.enqueue(item)
+
+    def _run_loop(self) -> None:
+        try:
+            import websockets
+        except ImportError as exc:
+            self._start_error = exc
+            self._started.set()
+            return
+
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._server = self._loop.run_until_complete(self._start_websocket_server(websockets))
+        except Exception as exc:
+            self._start_error = exc
+            self._started.set()
+            return
+
+        self.log_func(f"websocket server listening ws://{self.host}:{self.port}/intercom/ws?device=<device>")
+        self._started.set()
+        self._loop.run_forever()
+
+    async def _start_websocket_server(self, websockets_module: Any) -> Any:
+        return await websockets_module.serve(
+            self._handler,
+            self.host,
+            self.port,
+            ping_interval=self.ping_interval_s,
+            ping_timeout=self.ping_interval_s,
+            max_size=MAX_UDP_PACKET_BYTES,
+        )
+
+    async def _handler(self, websocket: Any, path: str | None = None) -> None:
+        resolved_path = self._resolve_path(websocket, path)
+        device = self._device_from_path(resolved_path)
+        if not device:
+            await websocket.close(code=1008, reason="device query required")
+            return
+
+        queue = WebSocketDownlinkQueue(
+            target_device=device,
+            max_audio_packets=self.max_audio_packets,
+            log_func=self.log_func,
+            log_every=self.log_every,
+        )
+        connection = WebSocketConnection(device=device, websocket=websocket, queue=queue)
+        self._register_connection(connection)
+        sender_task = asyncio.create_task(self._sender(connection))
+
+        try:
+            async for _message in websocket:
+                pass
+        except Exception as exc:
+            self.log_func(f"websocket receive ended device={device} error={exc}")
+        finally:
+            self._remove_connection(connection)
+            sender_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sender_task
+
+    async def _sender(self, connection: WebSocketConnection) -> None:
+        next_audio_send: float | None = None
+        try:
+            while True:
+                item = await asyncio.to_thread(connection.queue.get)
+                if item is None:
+                    return
+
+                pacing_lag = 0.0
+                if item.packet_type == APP_INTERCOM_PKT_AUDIO:
+                    now = time.monotonic()
+                    if next_audio_send is None or next_audio_send < now - self.interval_s:
+                        next_audio_send = now
+                    if now < next_audio_send:
+                        await asyncio.sleep(next_audio_send - now)
+                        now = time.monotonic()
+                    pacing_lag = max(0.0, now - next_audio_send)
+
+                await connection.websocket.send(item.packet_bytes)
+
+                if item.packet_type == APP_INTERCOM_PKT_AUDIO:
+                    connection.queue.sent_audio_count += 1
+                    queue_len = connection.queue.queue_len()
+                    if self.log_every > 0 and connection.queue.sent_audio_count % self.log_every == 0:
+                        self.log_func(
+                            f"websocket paced send target={connection.device} source={item.source_device} "
+                            f"ch={item.channel} type=audio queue_len={queue_len} "
+                            f"send_interval_ms={self.interval_s * 1000:.1f} pacing_lag_ms={pacing_lag * 1000:.2f}"
+                        )
+                    next_audio_send += self.interval_s
+                else:
+                    type_name = PKT_TYPES.get(item.packet_type, f"type_{item.packet_type}")
+                    self.log_func(
+                        f"websocket paced send target={connection.device} source={item.source_device} "
+                        f"ch={item.channel} type={type_name} queue_len={connection.queue.queue_len()}"
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.log_func(f"websocket send failed target={connection.device} error={exc}")
+            self._remove_connection(connection)
+            with contextlib.suppress(Exception):
+                await connection.websocket.close(code=1011, reason="send failed")
+
+    def _register_connection(self, connection: WebSocketConnection) -> None:
+        old: WebSocketConnection | None = None
+        with self._connections_lock:
+            old = self._connections.get(connection.device)
+            self._connections[connection.device] = connection
+
+        if old is not None and old is not connection:
+            old.queue.close()
+            self.log_func(f"websocket replaced old connection device={connection.device}")
+            loop = self._loop
+            if loop is not None:
+                loop.call_soon_threadsafe(asyncio.create_task, old.websocket.close(code=1000, reason="replaced"))
+
+        self.log_func(f"websocket connected device={connection.device}")
+
+    def _remove_connection(self, connection: WebSocketConnection) -> bool:
+        removed = False
+        with self._connections_lock:
+            if self._connections.get(connection.device) is connection:
+                self._connections.pop(connection.device, None)
+                removed = True
+        if removed:
+            connection.queue.close()
+            self.log_func(f"websocket disconnected device={connection.device}")
+        return removed
+
+    def _resolve_path(self, websocket: Any, path: str | None) -> str:
+        if path:
+            return path
+        request = getattr(websocket, "request", None)
+        request_path = getattr(request, "path", None)
+        if request_path:
+            return request_path
+        return getattr(websocket, "path", "") or ""
+
+    def _device_from_path(self, path: str) -> str:
+        parsed = urlparse(path)
+        if parsed.path != "/intercom/ws":
+            return ""
+        raw_device = parse_qs(parsed.query).get("device", [""])[0].strip()
+        if not raw_device:
+            return ""
+        return raw_device
+
+
 class FecGroupBuilder:
     """Build XOR AUDIO_FEC packets from contiguous downlink AUDIO groups."""
 
@@ -393,7 +747,15 @@ class FecGroupBuilder:
         )
 
 
-def run_udp(host: str, port: int, *, log_func=print) -> None:
+def run_udp(
+    host: str,
+    port: int,
+    *,
+    log_func=print,
+    downlink_transport: str | None = None,
+    ws_host: str | None = None,
+    ws_port: int | None = None,
+) -> None:
     """Run the blocking WTK1 UDP loop."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -418,6 +780,17 @@ def run_udp(host: str, port: int, *, log_func=print) -> None:
     nack_cache_seconds = max(_env_float("INTERCOM_NACK_CACHE_SECONDS", DEFAULT_NACK_CACHE_SECONDS), 0.1)
     nack_max_count = max(_env_int("INTERCOM_NACK_MAX_COUNT", DEFAULT_NACK_MAX_COUNT), 1)
     fec_group_size = max(_env_int("INTERCOM_FEC_GROUP_SIZE", DEFAULT_FEC_GROUP_SIZE), 2)
+    selected_transport = (downlink_transport or _env_str("INTERCOM_DOWNLINK_TRANSPORT", "udp")).strip().lower()
+    if selected_transport not in {"udp", "websocket"}:
+        log_func(f"INTERCOM_DOWNLINK_TRANSPORT invalid value={selected_transport!r}, fallback=udp")
+        selected_transport = "udp"
+    resolved_ws_host = ws_host or _env_str("INTERCOM_WS_HOST", host)
+    resolved_ws_port = ws_port if ws_port is not None else _env_int("INTERCOM_WS_PORT", DEFAULT_WS_PORT)
+    ws_queue_max_audio = max(_env_int("INTERCOM_WS_QUEUE_MAX_AUDIO", DEFAULT_WS_QUEUE_MAX_AUDIO), 1)
+    ws_ping_interval_s = max(
+        _env_int("INTERCOM_WS_PING_INTERVAL_SECONDS", DEFAULT_WS_PING_INTERVAL_SECONDS),
+        1,
+    )
     fec_log_every = max(audio_log_every // fec_group_size, 1) if audio_log_every > 0 else 0
     packet_cache = DownlinkPacketCache(
         max_packets_per_stream=nack_cache_packets,
@@ -428,9 +801,25 @@ def run_udp(host: str, port: int, *, log_func=print) -> None:
         log_func=log_func,
         log_every=fec_log_every,
     )
+    websocket_server: WebSocketDownlinkServer | None = None
+    if selected_transport == "websocket":
+        websocket_server = WebSocketDownlinkServer(
+            host=resolved_ws_host,
+            port=resolved_ws_port,
+            interval_s=pacing_interval_s,
+            max_audio_packets=ws_queue_max_audio,
+            log_func=log_func,
+            log_every=audio_log_every,
+            ping_interval_s=ws_ping_interval_s,
+        )
+        if not websocket_server.start():
+            log_func("websocket downlink unavailable; UDP service stopped because transport=websocket")
+            return
+
     log_func(f"UDP WTK1 监听 {host}:{port}")
     log_func(
         "UDP downlink codec=pcm mode=paced "
+        f"transport={selected_transport} "
         f"audio_log_every={audio_log_every} "
         f"pacing_interval_ms={pacing_interval_s * 1000:.1f} "
         f"prebuffer_packets={prebuffer_packets} "
@@ -442,6 +831,11 @@ def run_udp(host: str, port: int, *, log_func=print) -> None:
         f"nack_cache_seconds={nack_cache_seconds:.1f} "
         f"nack_max_count={nack_max_count}"
     )
+    if selected_transport == "websocket":
+        log_func(
+            f"websocket downlink enabled endpoint=ws://{resolved_ws_host}:{resolved_ws_port}/intercom/ws?device=<device> "
+            f"queue_max_audio={ws_queue_max_audio} ping_interval_s={ws_ping_interval_s} fallback=drop"
+        )
 
     def get_downlink_queue(
         key: DownlinkKey,
@@ -490,6 +884,12 @@ def run_udp(host: str, port: int, *, log_func=print) -> None:
             )
 
         if packet.packet_type == APP_INTERCOM_PKT_NACK:
+            if selected_transport == "websocket":
+                log_func(
+                    f"UDP nack ignored transport=websocket requester={packet.device}@{addr[0]}:{addr[1]} "
+                    f"ch={packet.channel} payload={len(packet.payload)}"
+                )
+                continue
             threading.Thread(
                 target=handle_nack_packet,
                 kwargs={
@@ -507,12 +907,44 @@ def run_udp(host: str, port: int, *, log_func=print) -> None:
             continue
 
         if packet.packet_type == APP_INTERCOM_PKT_PTT_START:
-            for target_device, target_addr in audio_targets(devices, packet, addr):
+            targets = audio_targets(devices, packet, addr)
+            if selected_transport == "websocket":
+                raw_packet = exact_wtk1_packet_bytes(data, packet)
+                for target_device, _target_addr in targets:
+                    if websocket_server is None:
+                        continue
+                    websocket_server.enqueue(
+                        target_device,
+                        WebSocketDownlinkItem(
+                            packet_bytes=raw_packet,
+                            packet_type=packet.packet_type,
+                            source_device=packet.device,
+                            channel=packet.channel,
+                        ),
+                    )
+                continue
+            for target_device, target_addr in targets:
                 key = DownlinkKey(target_device=target_device, source_device=packet.device, channel=packet.channel)
                 fec_builder.reset(key)
                 get_downlink_queue(key, target_addr).reset_stream()
 
         if packet.packet_type == APP_INTERCOM_PKT_PTT_STOP:
+            targets = audio_targets(devices, packet, addr)
+            if selected_transport == "websocket":
+                raw_packet = exact_wtk1_packet_bytes(data, packet)
+                for target_device, _target_addr in targets:
+                    if websocket_server is None:
+                        continue
+                    websocket_server.enqueue(
+                        target_device,
+                        WebSocketDownlinkItem(
+                            packet_bytes=raw_packet,
+                            packet_type=packet.packet_type,
+                            source_device=packet.device,
+                            channel=packet.channel,
+                        ),
+                    )
+                continue
             fec_builder.reset_source(source_device=packet.device, channel=packet.channel)
             for key, queue in list(downlink_queues.items()):
                 if key.source_device == packet.device and key.channel == packet.channel:
@@ -525,6 +957,26 @@ def run_udp(host: str, port: int, *, log_func=print) -> None:
                     log_func(
                         f"UDP audio downlink skipped source={packet.device} ch={packet.channel} "
                         f"pcm_payload_len={len(packet.payload)} target_count=0"
+                    )
+                continue
+            if selected_transport == "websocket":
+                raw_packet = exact_wtk1_packet_bytes(data, packet)
+                if should_log_audio:
+                    log_func(
+                        f"UDP audio downlink transport=websocket source={packet.device} ch={packet.channel} "
+                        f"pcm_payload_len={len(packet.payload)} packet_len={len(raw_packet)} target_count={len(targets)}"
+                    )
+                for target_device, _target_addr in targets:
+                    if websocket_server is None:
+                        continue
+                    websocket_server.enqueue(
+                        target_device,
+                        WebSocketDownlinkItem(
+                            packet_bytes=raw_packet,
+                            packet_type=packet.packet_type,
+                            source_device=packet.device,
+                            channel=packet.channel,
+                        ),
                     )
                 continue
             downlink = build_audio_downlink_packet(
@@ -594,6 +1046,11 @@ def build_audio_downlink_packet(
         device=packet.device,
         payload=packet.payload,
     )
+
+
+def exact_wtk1_packet_bytes(data: bytes, packet: Packet) -> bytes:
+    """Return the complete parsed WTK1 packet bytes without any UDP trailing data."""
+    return data[: HEADER_LEN + len(packet.payload)]
 
 
 def handle_nack_packet(
@@ -710,8 +1167,31 @@ def main(argv: list[str] | None = None) -> None:
         default=_env_int("INTERCOM_UDP_PORT", 19000),
         help="UDP bind port",
     )
+    parser.add_argument(
+        "--downlink-transport",
+        choices=("udp", "websocket"),
+        default=_env_str("INTERCOM_DOWNLINK_TRANSPORT", "udp"),
+        help="Server-to-device downlink transport",
+    )
+    parser.add_argument(
+        "--ws-host",
+        default=_env_str("INTERCOM_WS_HOST", _env_str("INTERCOM_HOST", "0.0.0.0")),
+        help="WebSocket bind host when downlink transport is websocket",
+    )
+    parser.add_argument(
+        "--ws-port",
+        type=int,
+        default=_env_int("INTERCOM_WS_PORT", DEFAULT_WS_PORT),
+        help="WebSocket bind port when downlink transport is websocket",
+    )
     args = parser.parse_args(argv)
-    run_udp(args.host, args.udp_port)
+    run_udp(
+        args.host,
+        args.udp_port,
+        downlink_transport=args.downlink_transport,
+        ws_host=args.ws_host,
+        ws_port=args.ws_port,
+    )
 
 
 if __name__ == "__main__":

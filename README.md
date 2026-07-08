@@ -5,7 +5,7 @@ ESP32 WTK1 设备的 UDP 实时对讲转发服务。
 这个仓库现在只保留对讲链路：
 
 ```text
-ESP32 device A -> WTK1 UDP AUDIO PCM -> server -> paced queue -> ESP32 device B
+ESP32 device A -> WTK1 UDP AUDIO PCM -> server -> UDP/WS paced downlink -> ESP32 device B
 ```
 
 已移除 AI 问答、ASR、TTS、相机上传、视觉识别、知识库和百炼应用相关代码。那些能力由其他项目承接。
@@ -48,7 +48,7 @@ Byte 34+:   payload
 
 `AUDIO` payload 保持设备端 PCM 原格式：PCM s16le / 16kHz / mono。服务端不改 packet type、header、seq、timestamp、device 字段或 payload 内容。
 
-`AUDIO_FEC` 是服务端下行前向纠错包。默认每 4 个连续 AUDIO 额外生成 1 个 XOR FEC 包，跟在该组最后一个 AUDIO 后进入同一个 paced 队列。FEC 只 XOR AUDIO payload，不改正常 AUDIO 包格式和 seq。
+`AUDIO_FEC` 是 UDP 下行模式里的服务端前向纠错包。默认每 4 个连续 AUDIO 额外生成 1 个 XOR FEC 包，跟在该组最后一个 AUDIO 后进入同一个 paced 队列。FEC 只 XOR AUDIO payload，不改正常 AUDIO 包格式和 seq。WebSocket 下行实验模式不发送 FEC。
 
 `AUDIO_FEC` payload 为固定头加 XOR 数据：
 
@@ -71,13 +71,14 @@ Byte 18-21: start_seq uint32 little-endian
 Byte 22-23: count uint16 little-endian
 ```
 
-服务端收到 NACK 后，会按 `target_device + channel + source_device + seq` 查最近已经下发给该目标设备的完整 AUDIO 包，找到就原样 UDP 补发；不会重新生成 seq，不会改 payload，不会重新编码 PCM。
+服务端收到 NACK 后，会按 `target_device + channel + source_device + seq` 查最近已经下发给该目标设备的完整 AUDIO 包，找到就原样 UDP 补发；不会重新生成 seq，不会改 payload，不会重新编码 PCM。WebSocket 下行实验模式会忽略 NACK。
 
 ## 安装
 
 ```bash
 python -m venv .venv
 cp .env.example .env
+python -m pip install -r requirements.txt
 ```
 
 Windows PowerShell：
@@ -85,6 +86,7 @@ Windows PowerShell：
 ```powershell
 py -m venv .venv
 copy .env.example .env
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 ## 启动
@@ -114,9 +116,38 @@ UDP WTK1 监听 0.0.0.0:19000
 UDP downlink codec=pcm mode=paced ...
 ```
 
+## WebSocket 下行实验模式
+
+默认仍是 UDP 下行。需要验证 TCP/WebSocket 有序可靠下行时，把 `.env` 改为：
+
+```text
+INTERCOM_DOWNLINK_TRANSPORT=websocket
+INTERCOM_WS_HOST=0.0.0.0
+INTERCOM_WS_PORT=18080
+INTERCOM_WS_QUEUE_MAX_AUDIO=50
+```
+
+设备端仍然通过 UDP `19000` 上行 `REGISTER / CHANNEL / HEARTBEAT / PTT_START / AUDIO / PTT_STOP`。设备端另外保持一个长连接：
+
+```text
+ws://<server-ip>:18080/intercom/ws?device=walkie-02
+```
+
+服务器用 query 参数里的 `device` 绑定连接；同一个 device 重连时，新连接覆盖旧连接并关闭旧连接。WebSocket binary frame 的内容就是完整 WTK1 packet bytes：
+
+```text
+WTK1 34-byte header + payload
+```
+
+不包装 JSON，不 base64，不改变 PCM、WTK1 header、seq、timestamp、device 或 20ms/640B 音频包大小。
+
+WebSocket 模式下，服务器只把 `PTT_START / AUDIO / PTT_STOP` 推给同频道其他设备；`HEARTBEAT` 不通过 WebSocket 转发，`FEC / NACK` 不参与 WebSocket 下行。目标设备 WebSocket 不在线时，服务端直接丢弃该目标下行并打印 `websocket target offline`，不会 fallback 到 UDP，便于观察实验效果。
+
+WebSocket 下行也有 per-device 队列和 20ms pacing；`INTERCOM_WS_QUEUE_MAX_AUDIO=50` 表示最多保留约 1 秒 audio。超过上限时丢最旧 AUDIO，保留最新 AUDIO；收到 `PTT_STOP` 时会优先下发 stop，并清理该 source 到该 target 尚未发送的旧 audio，避免继续播放历史声音。
+
 ## 下行队列
 
-服务端收到同频道设备的 `AUDIO` 包后，不直接突发 `sendto`，而是放入目标设备的 per-target 队列，再按固定节奏下发：
+UDP 下行模式下，服务端收到同频道设备的 `AUDIO` 包后，不直接突发 `sendto`，而是放入目标设备的 per-target 队列，再按固定节奏下发：
 
 ```text
 INTERCOM_PACING_INTERVAL_MS=20
@@ -129,6 +160,11 @@ INTERCOM_FEC_GROUP_SIZE=4
 INTERCOM_NACK_CACHE_PACKETS=200
 INTERCOM_NACK_CACHE_SECONDS=3
 INTERCOM_NACK_MAX_COUNT=16
+INTERCOM_DOWNLINK_TRANSPORT=udp
+INTERCOM_WS_HOST=0.0.0.0
+INTERCOM_WS_PORT=18080
+INTERCOM_WS_QUEUE_MAX_AUDIO=50
+INTERCOM_WS_PING_INTERVAL_SECONDS=20
 ```
 
 默认含义：
@@ -143,6 +179,9 @@ INTERCOM_NACK_MAX_COUNT=16
 - `INTERCOM_NACK_CACHE_PACKETS=200`：每个目标/频道/源设备缓存最近 200 个已下发 AUDIO 包。
 - `INTERCOM_NACK_CACHE_SECONDS=3`：缓存最长保留 3 秒。
 - `INTERCOM_NACK_MAX_COUNT=16`：单个 NACK 最多补发 16 个连续 seq，防止一次请求挤爆下行。
+- `INTERCOM_DOWNLINK_TRANSPORT=udp`：下行使用 UDP；改为 `websocket` 后，上行仍走 UDP，下行改走 `/intercom/ws`。
+- `INTERCOM_WS_QUEUE_MAX_AUDIO=50`：WebSocket 每设备最多保留约 1 秒 audio，超限丢最旧 audio。
+- `INTERCOM_WS_PING_INTERVAL_SECONDS=20`：WebSocket ping/pong 保活间隔。
 
 控制包仍用于维护设备状态；服务端只转发给同频道其他设备，不回发给发送者本人。
 
@@ -153,4 +192,4 @@ python -m compileall server tests
 python -m unittest tests.test_udp_pcm_forward
 ```
 
-不要提交 `.env`。公网服务器需要放行 UDP `19000` 入站端口。
+不要提交 `.env`。公网服务器需要放行 UDP `19000` 入站端口；WebSocket 下行实验模式还需要放行 TCP `18080`。
