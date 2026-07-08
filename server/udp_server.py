@@ -11,7 +11,7 @@ import threading
 import time
 from typing import Any
 from collections import OrderedDict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -45,6 +45,9 @@ DEFAULT_FEC_GROUP_SIZE = 4
 DEFAULT_WS_PORT = 18080
 DEFAULT_WS_QUEUE_MAX_AUDIO = 50
 DEFAULT_WS_PING_INTERVAL_SECONDS = 20
+SEQ_MOD = 0x100000000
+SEQ_HALF = 0x80000000
+DEFAULT_SEQ_FAR_JUMP_FRAMES = 1000
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -66,11 +69,95 @@ def load_env_file(path: Path) -> None:
 load_env_file(PROJECT_ROOT / ".env")
 
 
+def seq_next(seq: int) -> int:
+    return (seq + 1) & 0xFFFFFFFF
+
+
+def seq_delta(seq: int, expected_seq: int) -> int:
+    """Return signed uint32 distance from expected_seq to seq."""
+    delta = (seq - expected_seq) & 0xFFFFFFFF
+    if delta >= SEQ_HALF:
+        delta -= SEQ_MOD
+    return delta
+
+
 @dataclass(frozen=True)
 class DownlinkKey:
     target_device: str
     source_device: str
     channel: int
+
+
+@dataclass
+class UplinkAudioStats:
+    """Wrap-safe UDP AUDIO input continuity stats for one source/channel."""
+
+    source_device: str
+    channel: int
+    log_every: int
+    far_jump_frames: int
+    source_addr: tuple[str, int] = ("", 0)
+    input_rx: int = 0
+    input_gap_events: int = 0
+    input_gap_frames: int = 0
+    input_late: int = 0
+    input_dup: int = 0
+    input_far_jump: int = 0
+    expected_seq: int | None = None
+    last_rx_seq: int | None = None
+    _recent: OrderedDict[int, None] = field(default_factory=OrderedDict)
+
+    def observe(self, seq: int, source_addr: tuple[str, int]) -> bool:
+        self.source_addr = source_addr
+        self.input_rx += 1
+        should_log = self.log_every > 0 and self.input_rx % self.log_every == 0
+
+        if seq in self._recent:
+            self.input_dup += 1
+            self.last_rx_seq = seq
+            return True
+
+        self._remember(seq)
+        if self.expected_seq is None:
+            self.expected_seq = seq_next(seq)
+            self.last_rx_seq = seq
+            return True
+
+        delta = seq_delta(seq, self.expected_seq)
+        if delta == 0:
+            self.expected_seq = seq_next(seq)
+        elif delta > 0:
+            if delta > self.far_jump_frames:
+                self.input_far_jump += 1
+                self.expected_seq = seq_next(seq)
+                should_log = True
+            else:
+                self.input_gap_events += 1
+                self.input_gap_frames += delta
+                self.expected_seq = seq_next(seq)
+                should_log = True
+        else:
+            self.input_late += 1
+            should_log = True
+
+        self.last_rx_seq = seq
+        return should_log
+
+    def log_line(self) -> str:
+        return (
+            f"UDP uplink stats source={self.source_device} "
+            f"addr={self.source_addr[0]}:{self.source_addr[1]} ch={self.channel} "
+            f"rx={self.input_rx} gap={self.input_gap_events}/{self.input_gap_frames} "
+            f"late={self.input_late} dup={self.input_dup} far={self.input_far_jump} "
+            f"expected={self.expected_seq if self.expected_seq is not None else '-'} "
+            f"last_rx={self.last_rx_seq if self.last_rx_seq is not None else '-'}"
+        )
+
+    def _remember(self, seq: int) -> None:
+        self._recent[seq] = None
+        self._recent.move_to_end(seq)
+        while len(self._recent) > 256:
+            self._recent.popitem(last=False)
 
 
 @dataclass(frozen=True)
@@ -327,6 +414,17 @@ class WebSocketDownlinkItem:
     packet_type: int
     source_device: str
     channel: int
+    seq: int = -1
+
+
+@dataclass
+class WebSocketStreamStats:
+    enqueue_audio: int = 0
+    send_audio: int = 0
+    drop_audio: int = 0
+    clear_count: int = 0
+    queue_max: int = 0
+    pacing_lag_ms: float = 0.0
 
 
 class WebSocketDownlinkQueue:
@@ -339,14 +437,18 @@ class WebSocketDownlinkQueue:
         max_audio_packets: int,
         log_func=print,
         log_every: int,
+        high_water_audio: int | None = None,
     ) -> None:
         self.target_device = target_device
         self.max_audio_packets = max(max_audio_packets, 1)
+        default_high_water = max(int(self.max_audio_packets * 0.8), 1)
+        self.high_water_audio = max(min(high_water_audio or default_high_water, self.max_audio_packets), 1)
         self.log_func = log_func
         self.log_every = max(log_every, 0)
         self.drop_count = 0
         self.enqueued_audio_count = 0
         self.sent_audio_count = 0
+        self._stats: dict[tuple[str, int], WebSocketStreamStats] = {}
         self._queue: deque[WebSocketDownlinkItem] = deque()
         self._audio_count = 0
         self._closed = False
@@ -355,21 +457,29 @@ class WebSocketDownlinkQueue:
     def enqueue(self, item: WebSocketDownlinkItem) -> bool:
         with self._condition:
             if self._closed:
+                self.log_func(
+                    f"websocket enqueue dropped target={self.target_device} source={item.source_device} "
+                    f"ch={item.channel} type={PKT_TYPES.get(item.packet_type, item.packet_type)} "
+                    f"seq={item.seq} reason=queue_closed"
+                )
                 return False
             if item.packet_type == APP_INTERCOM_PKT_PTT_START:
                 self._clear_audio_locked(item.source_device, item.channel, reason="ptt_start")
                 self._append_priority_control_locked(item)
                 self._log_enqueue_locked(item)
             elif item.packet_type == APP_INTERCOM_PKT_PTT_STOP:
-                self._clear_audio_locked(item.source_device, item.channel, reason="ptt_stop")
-                self._append_priority_control_locked(item)
+                if self._audio_count > self.high_water_audio:
+                    self._clear_audio_locked(item.source_device, item.channel, reason="ptt_stop_high_water")
+                self._queue.append(item)
                 self._log_enqueue_locked(item)
             else:
                 if item.packet_type == APP_INTERCOM_PKT_AUDIO:
                     self._drop_oldest_audio_until_room_locked()
                     self._audio_count += 1
                     self.enqueued_audio_count += 1
+                    self._stats_for(item).enqueue_audio += 1
                 self._queue.append(item)
+                self._update_queue_max_locked(item)
                 self._log_enqueue_locked(item)
             self._condition.notify()
             return True
@@ -385,11 +495,11 @@ class WebSocketDownlinkQueue:
                 self._audio_count = max(self._audio_count - 1, 0)
             return item
 
-    def close(self) -> None:
+    def close(self, *, reason: str = "closed") -> None:
         with self._condition:
+            self._clear_all_audio_locked(reason=reason)
             self._closed = True
             self._queue.clear()
-            self._audio_count = 0
             self._condition.notify_all()
 
     def queue_len(self) -> int:
@@ -419,6 +529,29 @@ class WebSocketDownlinkQueue:
         if cleared:
             self._queue = kept
             self._audio_count = max(self._audio_count - cleared, 0)
+            stats = self._stats_for_source(source_device, channel)
+            stats.clear_count += cleared
+            self.log_func(
+                f"websocket clear queued audio target={self.target_device} source={source_device} "
+                f"ch={channel} reason={reason} cleared={cleared} queue_len={len(self._queue)}"
+            )
+
+    def _clear_all_audio_locked(self, *, reason: str) -> None:
+        if self._audio_count <= 0:
+            return
+        kept: deque[WebSocketDownlinkItem] = deque()
+        cleared_by_stream: dict[tuple[str, int], int] = {}
+        for queued in self._queue:
+            if queued.packet_type == APP_INTERCOM_PKT_AUDIO:
+                key = (queued.source_device, queued.channel)
+                cleared_by_stream[key] = cleared_by_stream.get(key, 0) + 1
+                continue
+            kept.append(queued)
+        self._queue = kept
+        self._audio_count = 0
+        for (source_device, channel), cleared in cleared_by_stream.items():
+            stats = self._stats_for_source(source_device, channel)
+            stats.clear_count += cleared
             self.log_func(
                 f"websocket clear queued audio target={self.target_device} source={source_device} "
                 f"ch={channel} reason={reason} cleared={cleared} queue_len={len(self._queue)}"
@@ -434,12 +567,15 @@ class WebSocketDownlinkQueue:
             if drop_index is None:
                 self._audio_count = 0
                 return
-            items.pop(drop_index)
+            dropped = items.pop(drop_index)
             self._queue = deque(items)
             self._audio_count -= 1
             self.drop_count += 1
+            stats = self._stats_for(dropped)
+            stats.drop_audio += 1
             self.log_func(
-                f"websocket drop old audio target={self.target_device} "
+                f"websocket drop old audio target={self.target_device} source={dropped.source_device} "
+                f"ch={dropped.channel} seq={dropped.seq} reason=queue_full "
                 f"drop_count={self.drop_count} queue_len={len(self._queue)}"
             )
 
@@ -452,7 +588,42 @@ class WebSocketDownlinkQueue:
                 return
         self.log_func(
             f"websocket downlink enqueue target={self.target_device} source={item.source_device} "
-            f"type={type_name} ch={item.channel} queue_len={len(self._queue)}"
+            f"type={type_name} ch={item.channel} seq={item.seq} queue_len={len(self._queue)}"
+        )
+
+    def record_sent(self, item: WebSocketDownlinkItem, *, pacing_lag_ms: float) -> None:
+        with self._condition:
+            if item.packet_type != APP_INTERCOM_PKT_AUDIO:
+                return
+            self.sent_audio_count += 1
+            stats = self._stats_for(item)
+            stats.send_audio += 1
+            stats.pacing_lag_ms = max(stats.pacing_lag_ms, pacing_lag_ms)
+            should_log = self.log_every > 0 and stats.send_audio % self.log_every == 0
+            if should_log:
+                self.log_func(self._stats_line_locked(item.source_device, item.channel, stats))
+
+    def stats_line(self, *, source_device: str, channel: int) -> str:
+        with self._condition:
+            stats = self._stats_for_source(source_device, channel)
+            return self._stats_line_locked(source_device, channel, stats)
+
+    def _stats_for(self, item: WebSocketDownlinkItem) -> WebSocketStreamStats:
+        return self._stats_for_source(item.source_device, item.channel)
+
+    def _stats_for_source(self, source_device: str, channel: int) -> WebSocketStreamStats:
+        return self._stats.setdefault((source_device, channel), WebSocketStreamStats())
+
+    def _update_queue_max_locked(self, item: WebSocketDownlinkItem) -> None:
+        stats = self._stats_for(item)
+        stats.queue_max = max(stats.queue_max, len(self._queue))
+
+    def _stats_line_locked(self, source_device: str, channel: int, stats: WebSocketStreamStats) -> str:
+        return (
+            f"WS downlink stats target={self.target_device} source={source_device} ch={channel} "
+            f"enqueue={stats.enqueue_audio} send={stats.send_audio} drop={stats.drop_audio} "
+            f"clear={stats.clear_count} queue_len={len(self._queue)} queue_max={stats.queue_max} "
+            f"pacing_lag_ms={stats.pacing_lag_ms:.2f}"
         )
 
 
@@ -473,6 +644,7 @@ class WebSocketDownlinkServer:
         port: int,
         interval_s: float,
         max_audio_packets: int,
+        high_water_audio: int,
         log_func=print,
         log_every: int,
         ping_interval_s: int,
@@ -481,6 +653,7 @@ class WebSocketDownlinkServer:
         self.port = port
         self.interval_s = max(interval_s, 0.001)
         self.max_audio_packets = max(max_audio_packets, 1)
+        self.high_water_audio = max(min(high_water_audio, self.max_audio_packets), 1)
         self.log_func = log_func
         self.log_every = max(log_every, 0)
         self.ping_interval_s = max(ping_interval_s, 1)
@@ -514,7 +687,11 @@ class WebSocketDownlinkServer:
             last = self._offline_log_at.get(target_device, 0.0)
             if now - last >= 1.0:
                 self._offline_log_at[target_device] = now
-                self.log_func(f"websocket target offline target={target_device} source={item.source_device} ch={item.channel}")
+                self.log_func(
+                    f"websocket target offline target={target_device} source={item.source_device} "
+                    f"ch={item.channel} type={PKT_TYPES.get(item.packet_type, item.packet_type)} "
+                    f"seq={item.seq} reason=fallback_drop"
+                )
             return False
         return connection.queue.enqueue(item)
 
@@ -559,6 +736,7 @@ class WebSocketDownlinkServer:
         queue = WebSocketDownlinkQueue(
             target_device=device,
             max_audio_packets=self.max_audio_packets,
+            high_water_audio=self.high_water_audio,
             log_func=self.log_func,
             log_every=self.log_every,
         )
@@ -598,12 +776,12 @@ class WebSocketDownlinkServer:
                 await connection.websocket.send(item.packet_bytes)
 
                 if item.packet_type == APP_INTERCOM_PKT_AUDIO:
-                    connection.queue.sent_audio_count += 1
                     queue_len = connection.queue.queue_len()
+                    connection.queue.record_sent(item, pacing_lag_ms=pacing_lag * 1000)
                     if self.log_every > 0 and connection.queue.sent_audio_count % self.log_every == 0:
                         self.log_func(
                             f"websocket paced send target={connection.device} source={item.source_device} "
-                            f"ch={item.channel} type=audio queue_len={queue_len} "
+                            f"ch={item.channel} type=audio seq={item.seq} queue_len={queue_len} "
                             f"send_interval_ms={self.interval_s * 1000:.1f} pacing_lag_ms={pacing_lag * 1000:.2f}"
                         )
                     next_audio_send += self.interval_s
@@ -611,7 +789,7 @@ class WebSocketDownlinkServer:
                     type_name = PKT_TYPES.get(item.packet_type, f"type_{item.packet_type}")
                     self.log_func(
                         f"websocket paced send target={connection.device} source={item.source_device} "
-                        f"ch={item.channel} type={type_name} queue_len={connection.queue.queue_len()}"
+                        f"ch={item.channel} type={type_name} seq={item.seq} queue_len={connection.queue.queue_len()}"
                     )
         except asyncio.CancelledError:
             raise
@@ -628,7 +806,7 @@ class WebSocketDownlinkServer:
             self._connections[connection.device] = connection
 
         if old is not None and old is not connection:
-            old.queue.close()
+            old.queue.close(reason="connection_replaced")
             self.log_func(f"websocket replaced old connection device={connection.device}")
             loop = self._loop
             if loop is not None:
@@ -643,7 +821,7 @@ class WebSocketDownlinkServer:
                 self._connections.pop(connection.device, None)
                 removed = True
         if removed:
-            connection.queue.close()
+            connection.queue.close(reason="connection_disconnected")
             self.log_func(f"websocket disconnected device={connection.device}")
         return removed
 
@@ -768,7 +946,9 @@ def run_udp(
     downlink_queues: dict[DownlinkKey, DownlinkQueue] = {}
     send_lock = threading.Lock()
     audio_counters: dict[tuple[str, int], int] = {}
+    uplink_audio_stats: dict[tuple[str, int], UplinkAudioStats] = {}
     audio_log_every = max(_env_int("INTERCOM_AUDIO_LOG_EVERY_N", DEFAULT_AUDIO_LOG_EVERY_N), 0)
+    seq_far_jump_frames = max(_env_int("INTERCOM_SEQ_FAR_JUMP_FRAMES", DEFAULT_SEQ_FAR_JUMP_FRAMES), 1)
     pacing_interval_s = max(_env_int("INTERCOM_PACING_INTERVAL_MS", DEFAULT_PACING_INTERVAL_MS), 1) / 1000.0
     prebuffer_packets = max(_env_int("INTERCOM_PREBUFFER_PACKETS", DEFAULT_PREBUFFER_PACKETS), 1)
     prebuffer_idle_flush_s = (
@@ -787,6 +967,10 @@ def run_udp(
     resolved_ws_host = ws_host or _env_str("INTERCOM_WS_HOST", host)
     resolved_ws_port = ws_port if ws_port is not None else _env_int("INTERCOM_WS_PORT", DEFAULT_WS_PORT)
     ws_queue_max_audio = max(_env_int("INTERCOM_WS_QUEUE_MAX_AUDIO", DEFAULT_WS_QUEUE_MAX_AUDIO), 1)
+    ws_queue_high_water_audio = max(
+        _env_int("INTERCOM_WS_QUEUE_HIGH_WATER_AUDIO", max(int(ws_queue_max_audio * 0.8), 1)),
+        1,
+    )
     ws_ping_interval_s = max(
         _env_int("INTERCOM_WS_PING_INTERVAL_SECONDS", DEFAULT_WS_PING_INTERVAL_SECONDS),
         1,
@@ -808,6 +992,7 @@ def run_udp(
             port=resolved_ws_port,
             interval_s=pacing_interval_s,
             max_audio_packets=ws_queue_max_audio,
+            high_water_audio=ws_queue_high_water_audio,
             log_func=log_func,
             log_every=audio_log_every,
             ping_interval_s=ws_ping_interval_s,
@@ -829,12 +1014,14 @@ def run_udp(
         f"fec_group_size={fec_group_size} "
         f"nack_cache_packets={nack_cache_packets} "
         f"nack_cache_seconds={nack_cache_seconds:.1f} "
-        f"nack_max_count={nack_max_count}"
+        f"nack_max_count={nack_max_count} "
+        f"seq_far_jump_frames={seq_far_jump_frames}"
     )
     if selected_transport == "websocket":
         log_func(
             f"websocket downlink enabled endpoint=ws://{resolved_ws_host}:{resolved_ws_port}/intercom/ws?device=<device> "
-            f"queue_max_audio={ws_queue_max_audio} ping_interval_s={ws_ping_interval_s} fallback=drop"
+            f"queue_max_audio={ws_queue_max_audio} queue_high_water_audio={ws_queue_high_water_audio} "
+            f"ping_interval_s={ws_ping_interval_s} fallback=drop"
         )
 
     def get_downlink_queue(
@@ -876,6 +1063,17 @@ def run_udp(
             counter_key = (packet.device, packet.channel)
             audio_counters[counter_key] = audio_counters.get(counter_key, 0) + 1
             should_log_audio = audio_log_every > 0 and audio_counters[counter_key] % audio_log_every == 0
+            stats = uplink_audio_stats.get(counter_key)
+            if stats is None:
+                stats = UplinkAudioStats(
+                    source_device=packet.device,
+                    channel=packet.channel,
+                    log_every=audio_log_every,
+                    far_jump_frames=seq_far_jump_frames,
+                )
+                uplink_audio_stats[counter_key] = stats
+            if stats.observe(packet.seq, addr):
+                log_func(stats.log_line())
 
         if packet.packet_type != APP_INTERCOM_PKT_AUDIO or should_log_audio:
             log_func(
@@ -920,6 +1118,7 @@ def run_udp(
                             packet_type=packet.packet_type,
                             source_device=packet.device,
                             channel=packet.channel,
+                            seq=packet.seq,
                         ),
                     )
                 continue
@@ -942,6 +1141,7 @@ def run_udp(
                             packet_type=packet.packet_type,
                             source_device=packet.device,
                             channel=packet.channel,
+                            seq=packet.seq,
                         ),
                     )
                 continue
@@ -976,6 +1176,7 @@ def run_udp(
                             packet_type=packet.packet_type,
                             source_device=packet.device,
                             channel=packet.channel,
+                            seq=packet.seq,
                         ),
                     )
                 continue

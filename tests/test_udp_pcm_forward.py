@@ -30,6 +30,7 @@ from server.udp_server import (  # noqa: E402
     DownlinkPacketCache,
     DownlinkQueue,
     FecGroupBuilder,
+    UplinkAudioStats,
     WebSocketDownlinkItem,
     WebSocketDownlinkQueue,
     audio_targets,
@@ -356,7 +357,7 @@ class UdpPcmForwardTest(unittest.TestCase):
         self.assertEqual(queue.drop_count, 2)
         self.assertTrue(any("websocket drop old audio" in item for item in logs))
 
-    def test_websocket_queue_ptt_stop_clears_old_audio_and_keeps_stop_first(self) -> None:
+    def test_websocket_queue_ptt_stop_keeps_queued_audio_and_sends_stop_last(self) -> None:
         queue = WebSocketDownlinkQueue(
             target_device="walkie-02",
             max_audio_packets=10,
@@ -389,11 +390,26 @@ class UdpPcmForwardTest(unittest.TestCase):
         parsed = parse_packet(item.packet_bytes)
         self.assertIsNotNone(parsed)
         assert parsed is not None
-        self.assertEqual(parsed.packet_type, APP_INTERCOM_PKT_PTT_STOP)
-        self.assertEqual(parsed.seq, 13)
-        self.assertEqual(queue.queue_len(), 0)
+        self.assertEqual(parsed.packet_type, APP_INTERCOM_PKT_AUDIO)
+        self.assertEqual(parsed.seq, 10)
+        self.assertEqual(queue.queue_len(), 3)
+        remaining = []
+        while queue.queue_len():
+            next_item = queue.get()
+            assert next_item is not None
+            next_packet = parse_packet(next_item.packet_bytes)
+            assert next_packet is not None
+            remaining.append((next_packet.packet_type, next_packet.seq))
+        self.assertEqual(
+            remaining,
+            [
+                (APP_INTERCOM_PKT_AUDIO, 11),
+                (APP_INTERCOM_PKT_AUDIO, 12),
+                (APP_INTERCOM_PKT_PTT_STOP, 13),
+            ],
+        )
 
-    def test_websocket_queue_control_order_before_audio(self) -> None:
+    def test_websocket_queue_ptt_start_before_audio_but_ptt_stop_after_audio(self) -> None:
         queue = WebSocketDownlinkQueue(
             target_device="walkie-02",
             max_audio_packets=10,
@@ -429,12 +445,57 @@ class UdpPcmForwardTest(unittest.TestCase):
 
         first = queue.get()
         second = queue.get()
+        third = queue.get()
         self.assertIsNotNone(first)
         self.assertIsNotNone(second)
+        self.assertIsNotNone(third)
         assert first is not None
         assert second is not None
+        assert third is not None
         self.assertEqual(parse_packet(first.packet_bytes).packet_type, APP_INTERCOM_PKT_PTT_START)
-        self.assertEqual(parse_packet(second.packet_bytes).packet_type, APP_INTERCOM_PKT_PTT_STOP)
+        self.assertEqual(parse_packet(second.packet_bytes).packet_type, APP_INTERCOM_PKT_AUDIO)
+        self.assertEqual(parse_packet(third.packet_bytes).packet_type, APP_INTERCOM_PKT_PTT_STOP)
+
+    def test_uplink_audio_stats_detects_gap_late_dup_and_wrap(self) -> None:
+        stats = UplinkAudioStats(
+            source_device="walkie-01",
+            channel=1,
+            log_every=50,
+            far_jump_frames=1000,
+        )
+
+        self.assertTrue(stats.observe(0xFFFFFFFE, ("10.0.0.2", 19000)))
+        self.assertFalse(stats.observe(0xFFFFFFFF, ("10.0.0.2", 19000)))
+        self.assertFalse(stats.observe(0, ("10.0.0.2", 19000)))
+        self.assertEqual(stats.input_gap_events, 0)
+        self.assertEqual(stats.expected_seq, 1)
+
+        self.assertTrue(stats.observe(3, ("10.0.0.2", 19000)))
+        self.assertEqual(stats.input_gap_events, 1)
+        self.assertEqual(stats.input_gap_frames, 2)
+        self.assertEqual(stats.expected_seq, 4)
+
+        self.assertTrue(stats.observe(2, ("10.0.0.2", 19000)))
+        self.assertEqual(stats.input_late, 1)
+
+        self.assertTrue(stats.observe(3, ("10.0.0.2", 19000)))
+        self.assertEqual(stats.input_dup, 1)
+
+    def test_uplink_audio_stats_far_jump_resyncs_without_gap_pollution(self) -> None:
+        stats = UplinkAudioStats(
+            source_device="walkie-01",
+            channel=1,
+            log_every=50,
+            far_jump_frames=10,
+        )
+
+        stats.observe(1, ("10.0.0.2", 19000))
+        self.assertTrue(stats.observe(200, ("10.0.0.2", 19000)))
+
+        self.assertEqual(stats.input_far_jump, 1)
+        self.assertEqual(stats.input_gap_events, 0)
+        self.assertEqual(stats.input_gap_frames, 0)
+        self.assertEqual(stats.expected_seq, 201)
 
     def test_fec_group_builder_generates_xor_after_four_contiguous_audio_packets(self) -> None:
         logs: list[str] = []
