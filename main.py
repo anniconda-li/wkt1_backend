@@ -1,8 +1,8 @@
-"""WTK1 UDP intercom service entry point."""
+"""WTK1 WebSocket intercom service entry point."""
 
 from __future__ import annotations
 
-from server.udp_server import main
+from server.intercom_server import main
 
 
 if __name__ == "__main__":
