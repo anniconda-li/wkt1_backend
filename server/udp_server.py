@@ -18,9 +18,12 @@ from urllib.parse import parse_qs, urlparse
 from server.protocol import (
     APP_INTERCOM_PKT_AUDIO,
     APP_INTERCOM_PKT_AUDIO_FEC,
+    APP_INTERCOM_PKT_CHANNEL,
+    APP_INTERCOM_PKT_HEARTBEAT,
     APP_INTERCOM_PKT_NACK,
     APP_INTERCOM_PKT_PTT_START,
     APP_INTERCOM_PKT_PTT_STOP,
+    APP_INTERCOM_PKT_REGISTER,
     PKT_TYPES,
     Packet,
     HEADER_LEN,
@@ -42,7 +45,7 @@ DEFAULT_NACK_CACHE_PACKETS = 200
 DEFAULT_NACK_CACHE_SECONDS = 3.0
 DEFAULT_NACK_MAX_COUNT = 16
 DEFAULT_FEC_GROUP_SIZE = 4
-DEFAULT_WS_PORT = 18080
+DEFAULT_WS_PORT = 18081
 DEFAULT_WS_QUEUE_MAX_AUDIO = 50
 DEFAULT_WS_PING_INTERVAL_SECONDS = 20
 SEQ_MOD = 0x100000000
@@ -633,6 +636,8 @@ class WebSocketConnection:
     device: str
     websocket: Any
     queue: WebSocketDownlinkQueue
+    channel: int = 1
+    last_active_at: float = field(default_factory=time.monotonic)
 
 
 class WebSocketDownlinkServer:
@@ -778,6 +783,14 @@ class WebSocketDownlinkServer:
                 f"reason=device_mismatch ch={packet.channel} seq={packet.seq} payload_len={len(packet.payload)}"
             )
             return
+
+        connection.last_active_at = time.monotonic()
+        if packet.packet_type in (
+            APP_INTERCOM_PKT_REGISTER,
+            APP_INTERCOM_PKT_CHANNEL,
+            APP_INTERCOM_PKT_HEARTBEAT,
+        ):
+            connection.channel = packet.channel or connection.channel
 
         type_name = PKT_TYPES.get(packet.packet_type, f"type_{packet.packet_type}")
         if packet.packet_type == APP_INTERCOM_PKT_AUDIO:
@@ -1011,10 +1024,10 @@ def run_udp(
     nack_cache_seconds = max(_env_float("INTERCOM_NACK_CACHE_SECONDS", DEFAULT_NACK_CACHE_SECONDS), 0.1)
     nack_max_count = max(_env_int("INTERCOM_NACK_MAX_COUNT", DEFAULT_NACK_MAX_COUNT), 1)
     fec_group_size = max(_env_int("INTERCOM_FEC_GROUP_SIZE", DEFAULT_FEC_GROUP_SIZE), 2)
-    selected_transport = (downlink_transport or _env_str("INTERCOM_DOWNLINK_TRANSPORT", "udp")).strip().lower()
+    selected_transport = (downlink_transport or _env_str("INTERCOM_DOWNLINK_TRANSPORT", "websocket")).strip().lower()
     if selected_transport not in {"udp", "websocket"}:
-        log_func(f"INTERCOM_DOWNLINK_TRANSPORT invalid value={selected_transport!r}, fallback=udp")
-        selected_transport = "udp"
+        log_func(f"INTERCOM_DOWNLINK_TRANSPORT invalid value={selected_transport!r}, fallback=websocket")
+        selected_transport = "websocket"
     resolved_ws_host = ws_host or _env_str("INTERCOM_WS_HOST", host)
     resolved_ws_port = ws_port if ws_port is not None else _env_int("INTERCOM_WS_PORT", DEFAULT_WS_PORT)
     ws_queue_max_audio = max(_env_int("INTERCOM_WS_QUEUE_MAX_AUDIO", DEFAULT_WS_QUEUE_MAX_AUDIO), 1)
@@ -1058,7 +1071,7 @@ def run_udp(
         log_func(
             f"websocket downlink enabled endpoint=ws://{resolved_ws_host}:{resolved_ws_port}/intercom/ws?device=<device> "
             f"queue_max_audio={ws_queue_max_audio} queue_high_water_audio={ws_queue_high_water_audio} "
-            f"ping_interval_s={ws_ping_interval_s} fallback=udp"
+            f"ping_interval_s={ws_ping_interval_s} fallback=disabled"
         )
 
     def get_downlink_queue(
@@ -1120,6 +1133,36 @@ def run_udp(
     def reset_processed_audio(packet: Packet) -> None:
         processed_audio_recent.pop((packet.device, packet.channel), None)
 
+    def enqueue_ws_packet_to_targets(
+        *,
+        raw_packet: bytes,
+        packet: Packet,
+        targets: list[tuple[str, tuple[str, int] | None]],
+    ) -> int:
+        sent_count = 0
+        for target_device, _target_addr in targets:
+            if websocket_server is None:
+                continue
+            sent_ws = websocket_server.enqueue(
+                target_device,
+                WebSocketDownlinkItem(
+                    packet_bytes=raw_packet,
+                    packet_type=packet.packet_type,
+                    source_device=packet.device,
+                    channel=packet.channel,
+                    seq=packet.seq,
+                ),
+            )
+            if sent_ws:
+                sent_count += 1
+            else:
+                log_func(
+                    f"websocket downlink drop target={target_device} source={packet.device} "
+                    f"ch={packet.channel} type={PKT_TYPES.get(packet.packet_type, packet.packet_type)} "
+                    f"seq={packet.seq} reason=ws_unavailable"
+                )
+        return sent_count
+
     def enqueue_udp_audio_downlink(
         *,
         packet: Packet,
@@ -1156,30 +1199,6 @@ def run_udp(
                     f"{log_prefix} 音频入队 target={target_device}@{target_addr[0]}:{target_addr[1]} "
                     f"source={packet.device} ch={packet.channel} payload={payload_len} "
                     f"queue_len={queue.queue_len()} drop_count={queue.drop_count}"
-                )
-
-    def send_udp_control_fallback(
-        *,
-        raw_packet: bytes,
-        packet: Packet,
-        targets: list[tuple[str, tuple[str, int] | None]],
-    ) -> None:
-        for target_device, target_addr in targets:
-            if target_addr is None:
-                continue
-            try:
-                with send_lock:
-                    sock.sendto(raw_packet, target_addr)
-            except OSError as exc:
-                log_func(
-                    f"websocket control fallback udp failed target={target_device}@{target_addr[0]}:{target_addr[1]} "
-                    f"source={packet.device} ch={packet.channel} seq={packet.seq} error={exc}"
-                )
-            else:
-                log_func(
-                    f"websocket control fallback udp target={target_device}@{target_addr[0]}:{target_addr[1]} "
-                    f"source={packet.device} ch={packet.channel} type={PKT_TYPES.get(packet.packet_type, packet.packet_type)} "
-                    f"seq={packet.seq}"
                 )
 
     def handle_incoming_packet(data: bytes, addr: tuple[str, int], *, transport_label: str) -> None:
@@ -1224,9 +1243,15 @@ def run_udp(
 
         if packet.packet_type == APP_INTERCOM_PKT_NACK:
             if selected_transport == "websocket":
+                targets = current_audio_targets(packet)
+                sent_count = enqueue_ws_packet_to_targets(
+                    raw_packet=exact_wtk1_packet_bytes(data, packet),
+                    packet=packet,
+                    targets=targets,
+                )
                 log_func(
-                    f"{transport_label} nack ignored transport=websocket requester={packet.device}@{addr[0]}:{addr[1]} "
-                    f"ch={packet.channel} payload={len(packet.payload)}"
+                    f"{transport_label} nack forward source={packet.device} ch={packet.channel} "
+                    f"seq={packet.seq} payload={len(packet.payload)} target_count={len(targets)} sent={sent_count}"
                 )
                 return
             threading.Thread(
@@ -1250,21 +1275,11 @@ def run_udp(
             targets = current_audio_targets(packet)
             if selected_transport == "websocket":
                 raw_packet = exact_wtk1_packet_bytes(data, packet)
-                for target_device, _target_addr in targets:
-                    if websocket_server is None:
-                        continue
-                    sent_ws = websocket_server.enqueue(
-                        target_device,
-                        WebSocketDownlinkItem(
-                            packet_bytes=raw_packet,
-                            packet_type=packet.packet_type,
-                            source_device=packet.device,
-                            channel=packet.channel,
-                            seq=packet.seq,
-                        ),
-                    )
-                    if not sent_ws:
-                        send_udp_control_fallback(raw_packet=raw_packet, packet=packet, targets=[(target_device, _target_addr)])
+                sent_count = enqueue_ws_packet_to_targets(raw_packet=raw_packet, packet=packet, targets=targets)
+                log_func(
+                    f"{transport_label} ptt_start forward source={packet.device} ch={packet.channel} "
+                    f"seq={packet.seq} target_count={len(targets)} sent={sent_count}"
+                )
                 return
             for target_device, target_addr in targets:
                 if target_addr is None:
@@ -1277,26 +1292,30 @@ def run_udp(
             targets = current_audio_targets(packet)
             if selected_transport == "websocket":
                 raw_packet = exact_wtk1_packet_bytes(data, packet)
-                for target_device, _target_addr in targets:
-                    if websocket_server is None:
-                        continue
-                    sent_ws = websocket_server.enqueue(
-                        target_device,
-                        WebSocketDownlinkItem(
-                            packet_bytes=raw_packet,
-                            packet_type=packet.packet_type,
-                            source_device=packet.device,
-                            channel=packet.channel,
-                            seq=packet.seq,
-                        ),
-                    )
-                    if not sent_ws:
-                        send_udp_control_fallback(raw_packet=raw_packet, packet=packet, targets=[(target_device, _target_addr)])
+                sent_count = enqueue_ws_packet_to_targets(raw_packet=raw_packet, packet=packet, targets=targets)
+                log_func(
+                    f"{transport_label} ptt_stop forward source={packet.device} ch={packet.channel} "
+                    f"seq={packet.seq} target_count={len(targets)} sent={sent_count}"
+                )
                 return
             fec_builder.reset_source(source_device=packet.device, channel=packet.channel)
             for key, queue in list(downlink_queues.items()):
                 if key.source_device == packet.device and key.channel == packet.channel:
                     queue.mark_source_stopped()
+
+        if packet.packet_type == APP_INTERCOM_PKT_AUDIO_FEC:
+            targets = current_audio_targets(packet)
+            if selected_transport == "websocket":
+                sent_count = enqueue_ws_packet_to_targets(
+                    raw_packet=exact_wtk1_packet_bytes(data, packet),
+                    packet=packet,
+                    targets=targets,
+                )
+                log_func(
+                    f"{transport_label} audio_fec forward source={packet.device} ch={packet.channel} "
+                    f"seq={packet.seq} payload={len(packet.payload)} target_count={len(targets)} sent={sent_count}"
+                )
+                return
 
         if packet.packet_type == APP_INTERCOM_PKT_AUDIO and packet.payload:
             targets = current_audio_targets(packet)
@@ -1314,26 +1333,7 @@ def run_udp(
                         f"{transport_label} audio downlink transport=websocket source={packet.device} ch={packet.channel} "
                         f"pcm_payload_len={len(packet.payload)} packet_len={len(raw_packet)} target_count={len(targets)}"
                     )
-                for target_device, _target_addr in targets:
-                    sent_ws = False
-                    if websocket_server is not None:
-                        sent_ws = websocket_server.enqueue(
-                            target_device,
-                            WebSocketDownlinkItem(
-                                packet_bytes=raw_packet,
-                                packet_type=packet.packet_type,
-                                source_device=packet.device,
-                                channel=packet.channel,
-                                seq=packet.seq,
-                            ),
-                        )
-                    if not sent_ws:
-                        enqueue_udp_audio_downlink(
-                            packet=packet,
-                            targets=[(target_device, _target_addr)],
-                            should_log_audio=should_log_audio,
-                            log_prefix="websocket fallback UDP",
-                        )
+                enqueue_ws_packet_to_targets(raw_packet=raw_packet, packet=packet, targets=targets)
                 return
             enqueue_udp_audio_downlink(
                 packet=packet,
@@ -1535,7 +1535,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--downlink-transport",
         choices=("udp", "websocket"),
-        default=_env_str("INTERCOM_DOWNLINK_TRANSPORT", "udp"),
+        default=_env_str("INTERCOM_DOWNLINK_TRANSPORT", "websocket"),
         help="Server-to-device downlink transport",
     )
     parser.add_argument(

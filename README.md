@@ -1,11 +1,11 @@
 # WKT1 Intercom Backend
 
-ESP32 WTK1 设备的 UDP 实时对讲转发服务。
+ESP32 WTK1 设备的 WebSocket 实时对讲转发服务。
 
 这个仓库现在只保留对讲链路：
 
 ```text
-ESP32 device A -> WTK1 UDP AUDIO PCM -> server -> UDP/WS paced downlink -> ESP32 device B
+ESP32 device A <-> WTK1 WebSocket binary <-> server <-> WTK1 WebSocket binary <-> ESP32 device B
 ```
 
 已移除 AI 问答、ASR、TTS、相机上传、视觉识别、知识库和百炼应用相关代码。那些能力由其他项目承接。
@@ -13,8 +13,8 @@ ESP32 device A -> WTK1 UDP AUDIO PCM -> server -> UDP/WS paced downlink -> ESP32
 ## 目录
 
 ```text
-server/     WTK1 协议解析和 UDP 对讲转发
-tests/      UDP 对讲单测
+server/     WTK1 协议解析和 WebSocket 对讲转发
+tests/      对讲协议和队列单测
 ```
 
 ## 协议
@@ -48,7 +48,7 @@ Byte 34+:   payload
 
 `AUDIO` payload 保持设备端 PCM 原格式：PCM s16le / 16kHz / mono。服务端不改 packet type、header、seq、timestamp、device 字段或 payload 内容。
 
-`AUDIO_FEC` 是 UDP 下行模式里的服务端前向纠错包。默认每 4 个连续 AUDIO 额外生成 1 个 XOR FEC 包，跟在该组最后一个 AUDIO 后进入同一个 paced 队列。FEC 只 XOR AUDIO payload，不改正常 AUDIO 包格式和 seq。WebSocket 下行实验模式不发送 FEC。
+`AUDIO_FEC` 在 WebSocket 模式下会按频道原样转发；服务端不改正常 AUDIO 包格式和 seq。
 
 `AUDIO_FEC` payload 为固定头加 XOR 数据：
 
@@ -71,7 +71,7 @@ Byte 18-21: start_seq uint32 little-endian
 Byte 22-23: count uint16 little-endian
 ```
 
-服务端收到 NACK 后，会按 `target_device + channel + source_device + seq` 查最近已经下发给该目标设备的完整 AUDIO 包，找到就原样 UDP 补发；不会重新生成 seq，不会改 payload，不会重新编码 PCM。WebSocket 下行实验模式会忽略 NACK。
+`NACK` 在 WebSocket 模式下会按频道原样转发；服务端不会重新生成 seq，不会改 payload，不会重新编码 PCM。
 
 ## 安装
 
@@ -112,26 +112,27 @@ python main.py --host 0.0.0.0 --udp-port 19000
 启动后会看到类似日志：
 
 ```text
+websocket server listening ws://0.0.0.0:18081/intercom/ws?device=<device>
 UDP WTK1 监听 0.0.0.0:19000
-UDP downlink codec=pcm mode=paced ...
+UDP downlink codec=pcm mode=paced transport=websocket ...
 ```
 
 ## WebSocket 全双工实验模式
 
-默认仍是 UDP。需要验证 WebSocket 全双工时，把 `.env` 改为：
+默认使用 WebSocket 全双工。AI/相机 HTTP 服务继续使用 `18080`，对讲 WebSocket 独立使用 `18081`：
 
 ```text
 INTERCOM_DOWNLINK_TRANSPORT=websocket
 INTERCOM_WS_HOST=0.0.0.0
-INTERCOM_WS_PORT=18080
+INTERCOM_WS_PORT=18081
 INTERCOM_WS_QUEUE_MAX_AUDIO=50
 INTERCOM_WS_QUEUE_HIGH_WATER_AUDIO=40
 ```
 
-设备端可以继续通过 UDP `19000` 上行 `REGISTER / CHANNEL / HEARTBEAT / PTT_START / AUDIO / PTT_STOP`，也可以通过同一个 WebSocket 长连接发送完整 WTK1 binary packet 上行：
+设备端通过同一个 WebSocket 长连接发送和接收完整 WTK1 binary packet：
 
 ```text
-ws://<server-ip>:18080/intercom/ws?device=walkie-02
+ws://<server-ip>:18081/intercom/ws?device=walkie-02
 ```
 
 服务器用 query 参数里的 `device` 绑定连接；同一个 device 重连时，新连接覆盖旧连接并关闭旧连接。WebSocket 上行和下行 binary frame 的内容都是完整 WTK1 packet bytes：
@@ -142,7 +143,7 @@ WTK1 34-byte header + payload
 
 不包装 JSON，不 base64，不改变 PCM、WTK1 header、seq、timestamp、device 或 20ms/640B 音频包大小。
 
-WebSocket 模式下，服务器会监听设备发来的 binary message，解析为 WTK1 后进入和 UDP 上行相同的处理管线。下行优先走目标设备的 WebSocket；如果目标设备 WebSocket 不在线但有 UDP 注册地址，会回退到 UDP paced queue。`HEARTBEAT / REGISTER / CHANNEL` 用于更新设备在线和频道状态；`FEC / NACK` 仍只服务 UDP 下行链路。
+WebSocket 模式下，服务器会监听设备发来的 binary message，解析为 WTK1 后按包头 channel 转发给同频道其他在线设备。`REGISTER / CHANNEL / HEARTBEAT` 用于更新设备在线、频道和活跃时间；`PTT_START / AUDIO / PTT_STOP / NACK / AUDIO_FEC` 会按频道原样转发。固件当前只走 WebSocket，不再走 UDP fallback。
 
 WebSocket 下行也有 per-device 队列和 20ms pacing；`INTERCOM_WS_QUEUE_MAX_AUDIO=50` 表示最多保留约 1 秒 audio。超过上限时丢最旧 AUDIO，保留最新 AUDIO。`PTT_STOP` 默认不会清理已经入队的 audio，而是排在当前语音流尾部发送；只有队列超过 `INTERCOM_WS_QUEUE_HIGH_WATER_AUDIO` 或连接异常时才会清理旧 audio，并打印 clear reason。
 
@@ -160,7 +161,7 @@ WS downlink stats target=walkie-02 source=walkie-01 ch=1 enqueue=50 send=50 drop
 
 ## 下行队列
 
-UDP 下行模式下，服务端收到同频道设备的 `AUDIO` 包后，不直接突发 `sendto`，而是放入目标设备的 per-target 队列，再按固定节奏下发：
+服务端收到同频道设备的 `AUDIO` 包后，不直接突发写入 WebSocket，而是放入目标设备的 per-target 队列，再按固定节奏下发：
 
 ```text
 INTERCOM_PACING_INTERVAL_MS=20
@@ -173,9 +174,9 @@ INTERCOM_FEC_GROUP_SIZE=4
 INTERCOM_NACK_CACHE_PACKETS=200
 INTERCOM_NACK_CACHE_SECONDS=3
 INTERCOM_NACK_MAX_COUNT=16
-INTERCOM_DOWNLINK_TRANSPORT=udp
+INTERCOM_DOWNLINK_TRANSPORT=websocket
 INTERCOM_WS_HOST=0.0.0.0
-INTERCOM_WS_PORT=18080
+INTERCOM_WS_PORT=18081
 INTERCOM_WS_QUEUE_MAX_AUDIO=50
 INTERCOM_WS_QUEUE_HIGH_WATER_AUDIO=40
 INTERCOM_WS_PING_INTERVAL_SECONDS=20
@@ -194,8 +195,8 @@ INTERCOM_SEQ_FAR_JUMP_FRAMES=1000
 - `INTERCOM_NACK_CACHE_PACKETS=200`：每个目标/频道/源设备缓存最近 200 个已下发 AUDIO 包。
 - `INTERCOM_NACK_CACHE_SECONDS=3`：缓存最长保留 3 秒。
 - `INTERCOM_NACK_MAX_COUNT=16`：单个 NACK 最多补发 16 个连续 seq，防止一次请求挤爆下行。
-- `INTERCOM_DOWNLINK_TRANSPORT=udp`：默认 UDP 转发；改为 `websocket` 后，WebSocket 上行可用，下行优先走 `/intercom/ws`，目标无 WS 时回退 UDP。
-- WebSocket 上行 binary frame 也是完整 WTK1 packet；UDP fallback 仍保留。
+- `INTERCOM_DOWNLINK_TRANSPORT=websocket`：WebSocket 全双工对讲，binary frame 是完整 WTK1 packet。
+- 固件当前不走 UDP fallback；目标设备 WebSocket 不在线时，服务端只记录 drop。
 - `INTERCOM_WS_QUEUE_MAX_AUDIO=50`：WebSocket 每设备最多保留约 1 秒 audio，超限丢最旧 audio。
 - `INTERCOM_WS_QUEUE_HIGH_WATER_AUDIO=40`：`PTT_STOP` 到来时，只有积压超过该值才会清 audio。
 - `INTERCOM_WS_PING_INTERVAL_SECONDS=20`：WebSocket ping/pong 保活间隔。
@@ -210,4 +211,4 @@ python -m compileall server tests
 python -m unittest tests.test_udp_pcm_forward
 ```
 
-不要提交 `.env`。公网服务器需要放行 UDP `19000` 入站端口；WebSocket 下行实验模式还需要放行 TCP `18080`。
+不要提交 `.env`。公网服务器需要放行 TCP `18081`；如果仍保留旧 UDP 兼容输入，再额外放行 UDP `19000`。
