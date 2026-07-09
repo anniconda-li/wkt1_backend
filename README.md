@@ -43,8 +43,6 @@ Byte 34+:   payload
 4 AUDIO
 5 PTT_STOP
 6 HEARTBEAT
-7 NACK
-8 AUDIO_FEC
 ```
 
 `AUDIO` payload 仍是 PCM s16le / 16kHz / mono，通常每包 20ms、640 bytes。
@@ -52,9 +50,11 @@ Byte 34+:   payload
 服务端行为：
 
 - `REGISTER / CHANNEL / HEARTBEAT` 更新连接状态、频道和活跃时间，不转发。
-- `PTT_START / AUDIO / PTT_STOP / NACK / AUDIO_FEC` 按包头 channel 转发给同频道其他在线设备。
+- `PTT_START / AUDIO / PTT_STOP` 按包头 channel 转发给同频道其他在线设备。
+- 其他 type 一律丢弃并记录 `unsupported_type`，本项目不实现 NACK、FEC、重传或纠错缓存。
 - 转发时原样发送收到的 binary bytes，不重组、不改 seq、不改 timestamp、不改 payload。
 - 同一个 device 重连时，新连接替换旧连接。
+- 每个设备有独立发送队列和写超时；队列满时优先丢弃旧 `AUDIO`，尽量保留 `PTT_START / PTT_STOP`。
 
 ## 安装
 
@@ -99,6 +99,8 @@ python main.py --host 0.0.0.0 --port 18081
 INTERCOM_HOST=0.0.0.0
 INTERCOM_WS_PORT=18081
 INTERCOM_AUDIO_LOG_EVERY_N=50
+INTERCOM_SEND_QUEUE_MAX=80
+INTERCOM_SEND_TIMEOUT_SECONDS=2
 ```
 
 设备连接：
@@ -112,6 +114,7 @@ ws://<server_host>:18081/intercom/ws?device=walkie-02
 
 ```text
 WTK1 intercom websocket listening ws://0.0.0.0:18081/intercom/ws?device=<device>
+ws send queue max=80 send_timeout_seconds=2.0
 ws connect device=walkie-01 channel=1
 ws connect device=walkie-02 channel=1
 ```
@@ -121,9 +124,9 @@ ws connect device=walkie-02 channel=1
 ```text
 ws register device=walkie-01 ch=1 seq=0 payload=0
 ws channel device=walkie-01 ch=2 seq=8 payload=0
-ws forward type=ptt_start source=walkie-01 ch=2 seq=9 payload=0 targets=1 sent=1 target_devices=walkie-02
-ws audio source=walkie-01 ch=2 seq=59 payload=640 targets=1 sent=1 target_devices=walkie-02
-ws forward type=ptt_stop source=walkie-01 ch=2 seq=100 payload=0 targets=1 sent=1 target_devices=walkie-02
+ws forward type=ptt_start source=walkie-01 ch=2 seq=9 payload=0 targets=1 queued=1 target_devices=walkie-02
+ws audio source=walkie-01 ch=2 seq=59 payload=640 targets=1 queued=1 target_devices=walkie-02
+ws forward type=ptt_stop source=walkie-01 ch=2 seq=100 payload=0 targets=1 queued=1 target_devices=walkie-02
 ```
 
 ## 测试
