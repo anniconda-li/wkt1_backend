@@ -55,6 +55,8 @@ Byte 34+:   payload
 - 转发时原样发送收到的 binary bytes，不重组、不改 seq、不改 timestamp、不改 payload。
 - 同一个 device 重连时，新连接替换旧连接。
 - 每个设备有独立发送队列和写超时；队列满时优先丢弃旧 `AUDIO`，尽量保留 `PTT_START / PTT_STOP`。
+- 音频日志默认按 1 秒聚合，避免逐包打印影响实时性能。
+- 队列里的旧音频超过实时窗口会被丢弃，不会无限补播历史声音。
 
 ## 安装
 
@@ -98,9 +100,13 @@ python main.py --host 0.0.0.0 --port 18081
 ```text
 INTERCOM_HOST=0.0.0.0
 INTERCOM_WS_PORT=18081
+INTERCOM_LOG_STATS=1
+INTERCOM_LOG_AUDIO_TRACE=0
 INTERCOM_AUDIO_LOG_EVERY_N=50
 INTERCOM_SEND_QUEUE_MAX=80
 INTERCOM_SEND_TIMEOUT_SECONDS=2
+INTERCOM_REALTIME_WINDOW_MS=400
+INTERCOM_STATS_INTERVAL_MS=1000
 ```
 
 设备连接：
@@ -113,20 +119,22 @@ ws://<server_host>:18081/intercom/ws?device=walkie-02
 启动成功日志：
 
 ```text
-WTK1 intercom websocket listening ws://0.0.0.0:18081/intercom/ws?device=<device>
-ws send queue max=80 send_timeout_seconds=2.0
-ws connect device=walkie-01 channel=1
-ws connect device=walkie-02 channel=1
+intercom_service level=info event=listening url=ws://0.0.0.0:18081/intercom/ws?device=<device>
+intercom_config level=info send_queue_max=80 send_timeout_s=2.0 log_stats=1 log_audio_trace=0 realtime_window_ms=400 stats_interval_ms=1000
+intercom_conn level=info event=connect device=walkie-01 ip=1.2.3.4 port=12345 channel=1 active=1
+intercom_conn level=info event=connect device=walkie-02 ip=1.2.3.5 port=12346 channel=1 active=2
 ```
 
-转发日志示例：
+日志示例：
 
 ```text
-ws register device=walkie-01 ch=1 seq=0 payload=0
-ws channel device=walkie-01 ch=2 seq=8 payload=0
-ws forward type=ptt_start source=walkie-01 ch=2 seq=9 payload=0 targets=1 queued=1 target_devices=walkie-02
-ws audio source=walkie-01 ch=2 seq=59 payload=640 targets=1 queued=1 target_devices=walkie-02
-ws forward type=ptt_stop source=walkie-01 ch=2 seq=100 payload=0 targets=1 queued=1 target_devices=walkie-02
+intercom_conn level=info event=register device=walkie-01 ch=1 seq=0 active=2
+intercom_conn level=info event=channel device=walkie-01 old_ch=1 ch=2 seq=8
+intercom_ptt level=info event=start device=walkie-01 ch=2 seq=9 targets=1 queued=1
+intercom_rx level=info win=1s device=walkie-01 ch=2 audio=50 bytes=32000 gap=0 dup=0 p50_ms=20 p95_ms=28 max_ms=55 first_seq=10 last_seq=59
+intercom_tx level=info win=1s target=walkie-02 from=walkie-01 ch=2 audio=50 sent=50 drop_old=0 drop_slow=0 q=0 q_max=4 oldest_ms=0 send_p95_ms=4 send_max_ms=18 target_ch=2
+intercom_slow level=warn target=walkie-02 from=walkie-01 ch=2 q=30 oldest_ms=620 action=drop_old drop=12 keep_ms=400 first_seq=120
+intercom_ptt level=info event=stop device=walkie-01 ch=2 seq=100 targets=1 queued=1
 ```
 
 ## 测试

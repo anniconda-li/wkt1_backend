@@ -143,7 +143,28 @@ class IntercomServerTest(unittest.IsolatedAsyncioTestCase):
         await drain_outbox(target)
 
         self.assertEqual(target_ws.sent, [audio2, audio3])
-        self.assertTrue(any("queue_drop_audio" in item and "seq=1" in item for item in logs))
+        self.assertTrue(
+            any("intercom_slow" in item and "action=drop_old" in item and "first_seq=1" in item for item in logs)
+        )
+
+    async def test_aggregate_stats_report_rx_gap_and_tx_queue(self) -> None:
+        logs: list[str] = []
+        hub = IntercomHub(log_func=logs.append, audio_log_every=0)
+        source_ws = FakeWebSocket()
+        target_ws = FakeWebSocket()
+        source = IntercomConnection(device_id="walkie-01", websocket=source_ws, channel=1)
+        target = IntercomConnection(device_id="walkie-02", websocket=target_ws, channel=1)
+        await hub.add_connection(source)
+        await hub.add_connection(target)
+        audio1 = packet(APP_INTERCOM_PKT_AUDIO, channel=1, seq=1, payload=b"\x00\x00" * 320)
+        audio3 = packet(APP_INTERCOM_PKT_AUDIO, channel=1, seq=3, payload=b"\x00\x00" * 320)
+
+        await hub.handle_binary(source, audio1)
+        await hub.handle_binary(source, audio3)
+        hub.emit_stats()
+
+        self.assertTrue(any("intercom_rx" in item and "gap=1" in item for item in logs))
+        self.assertTrue(any("intercom_tx" in item and "audio=2" in item and "q=2" in item for item in logs))
 
     async def test_rejects_bad_frame_and_device_mismatch(self) -> None:
         logs: list[str] = []
