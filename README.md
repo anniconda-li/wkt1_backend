@@ -139,6 +139,14 @@ Docker 健康检查，部署编排应通过 WebSocket 握手探测
 健康检查端点。完整环境变量和可直接执行的探针命令见
 [`docs/deployment.md`](docs/deployment.md)。
 
+### 正式镜像发布
+
+普通 push 和 Pull Request 只运行测试与 Docker 构建验证，不发布镜像。只有推送
+`vX.Y.Z` 格式的 Git 标签才会发布到
+`ghcr.io/anniconda-li/wkt-intercom-server:<version>`。例如 `v0.1.0` 会生成镜像标签
+`0.1.0`，同时生成 `sha-<短提交号>` 标签。部署必须使用明确版本，不使用
+`latest`。本次发布流程建设不创建 `v0.1.0` 标签。
+
 `.env` 默认配置：
 
 ```text
