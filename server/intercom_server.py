@@ -1,4 +1,4 @@
-"""WTK1 WebSocket intercom relay."""
+"""wkt-intercom-server WebSocket relay."""
 
 from __future__ import annotations
 
@@ -865,7 +865,7 @@ def _env_str(name: str, default: str) -> str:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Run the WTK1 WebSocket intercom relay.")
+    parser = argparse.ArgumentParser(description="Run the wkt-intercom-server WebSocket relay.")
     parser.add_argument("--host", default=_env_str("INTERCOM_HOST", DEFAULT_HOST), help="WebSocket bind host")
     parser.add_argument(
         "--port",

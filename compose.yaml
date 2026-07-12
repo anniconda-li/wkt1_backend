@@ -1,0 +1,21 @@
+name: wkt-intercom-server
+
+services:
+  intercom:
+    image: wkt-intercom-server:local
+    container_name: wkt-intercom-server
+    build:
+      context: .
+    restart: unless-stopped
+    environment:
+      INTERCOM_HOST: 0.0.0.0
+      INTERCOM_WS_PORT: 18081
+      INTERCOM_LOG_STATS: ${INTERCOM_LOG_STATS:-1}
+      INTERCOM_LOG_AUDIO_TRACE: ${INTERCOM_LOG_AUDIO_TRACE:-0}
+      INTERCOM_AUDIO_LOG_EVERY_N: ${INTERCOM_AUDIO_LOG_EVERY_N:-50}
+      INTERCOM_SEND_QUEUE_MAX: ${INTERCOM_SEND_QUEUE_MAX:-80}
+      INTERCOM_SEND_TIMEOUT_SECONDS: ${INTERCOM_SEND_TIMEOUT_SECONDS:-2}
+      INTERCOM_REALTIME_WINDOW_MS: ${INTERCOM_REALTIME_WINDOW_MS:-400}
+      INTERCOM_STATS_INTERVAL_MS: ${INTERCOM_STATS_INTERVAL_MS:-1000}
+    ports:
+      - "${INTERCOM_WS_PORT:-18081}:18081"

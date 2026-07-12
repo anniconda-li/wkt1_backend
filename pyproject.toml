@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wkt-intercom-server"
+version = "0.1.0"
+description = "WebSocket intercom relay for WTK1 devices"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "websockets>=12,<16",
+]
+
+[project.scripts]
+wkt-intercom-server = "server.intercom_server:main"
+
+[tool.setuptools]
+packages = ["server"]

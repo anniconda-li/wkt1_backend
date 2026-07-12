@@ -1,4 +1,4 @@
-"""WTK1 WebSocket intercom service entry point."""
+"""wkt-intercom-server entry point."""
 
 from __future__ import annotations
 

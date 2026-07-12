@@ -1,4 +1,4 @@
-"""WTK1 WebSocket intercom relay tests."""
+"""wkt-intercom-server WebSocket relay tests."""
 
 from __future__ import annotations
 

@@ -1,6 +1,19 @@
-# WKT1 Intercom Backend
+# wkt-intercom-server
 
-ESP32 WTK1 设备的 WebSocket 实时对讲转发服务。
+`wkt-intercom-server` 是 ESP32 WTK1 设备的 WebSocket 实时对讲转发服务。
+
+项目身份约定：
+
+| 项目项 | 名称 |
+| --- | --- |
+| 项目、仓库与本地目录 | `wkt-intercom-server` |
+| Docker 镜像 | `wkt-intercom-server` |
+| Docker 容器 | `wkt-intercom-server` |
+| Compose 服务 | `intercom` |
+
+本仓库保持独立 Git 仓库、独立 GitHub 仓库和独立部署单元。它不是
+`wkt-platform` monorepo 的一部分；`wkt-platform` 仅作为本地父目录。ESP-IDF
+固件项目 `walkie-talkiev1`、AI 服务和 OTA 服务均不属于本仓库。
 
 这个项目现在只做一件事：
 
@@ -95,6 +108,30 @@ Windows PowerShell：
 python main.py --host 0.0.0.0 --port 18081
 ```
 
+## Docker
+
+构建镜像：
+
+```bash
+docker build --tag wkt-intercom-server .
+```
+
+直接运行容器：
+
+```bash
+docker run --rm --name wkt-intercom-server --env-file .env -p 18081:18081 wkt-intercom-server
+```
+
+使用 Compose 启动服务：
+
+```bash
+docker compose up --build intercom
+```
+
+镜像名、容器名和 Compose 服务名分别固定为 `wkt-intercom-server`、
+`wkt-intercom-server` 和 `intercom`。端口仍为 `18081`，WebSocket 路径仍为
+`/intercom/ws`。
+
 `.env` 默认配置：
 
 ```text
@@ -144,4 +181,7 @@ python -m compileall server tests
 python -m unittest discover -s tests -p "test*.py"
 ```
 
-不要提交 `.env`。公网服务器需要放行 TCP `18081`。
+CI 会运行以上检查并构建 `wkt-intercom-server:ci` 镜像，但不会推送镜像或部署环境。
+
+详细的容器运行与手工部署检查项见 [`docs/deployment.md`](docs/deployment.md)。不要提交
+`.env`。公网服务器需要放行 TCP `18081`。

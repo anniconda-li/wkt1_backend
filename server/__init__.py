@@ -1,1 +1,1 @@
-"""WTK1 UDP protocol and intercom forwarding service."""
+"""wkt-intercom-server package."""
