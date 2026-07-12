@@ -132,6 +132,13 @@ docker compose up --build intercom
 `wkt-intercom-server` 和 `intercom`。端口仍为 `18081`，WebSocket 路径仍为
 `/intercom/ws`。
 
+容器默认启动命令是 `python main.py`，容器端口为 `18081/tcp`。服务无持久化
+状态，不需要 Volume；日志写到标准输出和标准错误。镜像和 Compose 当前没有内置
+Docker 健康检查，部署编排应通过 WebSocket 握手探测
+`/intercom/ws?device=wkt-deploy-healthcheck`，握手成功后立即断开。服务不提供 HTTP
+健康检查端点。完整环境变量和可直接执行的探针命令见
+[`docs/deployment.md`](docs/deployment.md)。
+
 `.env` 默认配置：
 
 ```text
